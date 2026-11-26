@@ -20,6 +20,7 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
+use crate::instance::CleanupCause;
 use crate::server::Server;
 use crate::{
     agent, agent_db, backends, commands, db_kind, embedding, extension, extensions, grants,
@@ -363,12 +364,24 @@ impl BuiltServer {
     /// Stop this runtime without consuming its cleanup ownership. Incomplete
     /// MCP cleanup is observable and retryable; replacement must not proceed.
     pub async fn try_shutdown(&self) -> Result<(), String> {
+        self.try_shutdown_with_cause(CleanupCause::Explicit).await
+    }
+
+    pub(crate) async fn try_shutdown_with_cause(&self, cause: CleanupCause) -> Result<(), String> {
         self.server.mcp_registry().begin_close()?;
         self.server_slot.clear();
+        let cause = cause.as_str();
+        let start = Instant::now();
+        info!(cause, "Registered-session cleanup begin");
         let sessions = self.server.registered_session_ids().await;
         for session in sessions {
             self.server.deregister_session(&session).await;
         }
+        info!(
+            cause,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Registered-session cleanup end"
+        );
         self.server.shutdown().await;
         for slot in &self.tasks {
             let mut slot = slot.lock().await;

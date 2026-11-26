@@ -188,6 +188,30 @@ pub async fn probe_service(instance: &Instance) -> Result<(), ConnectError> {
         .map_err(ConnectError::Connection)
 }
 
+/// Why the current generation is being cleaned up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupCause {
+    TerminalShutdown,
+    ShutdownListenerEnded,
+    GenerationReplacement,
+    GenerationFinished,
+    ServiceProbeFailed,
+    Explicit,
+}
+
+impl CleanupCause {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TerminalShutdown => "terminal_shutdown",
+            Self::ShutdownListenerEnded => "shutdown_listener_ended",
+            Self::GenerationReplacement => "generation_replacement",
+            Self::GenerationFinished => "generation_finished",
+            Self::ServiceProbeFailed => "service_probe_failed",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
 /// One application generation, retained by its caller across incomplete cleanup.
 #[allow(async_fn_in_trait)]
 pub trait ServiceGeneration: Sized {
@@ -198,12 +222,12 @@ pub trait ServiceGeneration: Sized {
     async fn finished(&mut self) -> anyhow::Result<()>;
 
     /// Bounded MCP cleanup failure leaves this generation available for retry.
-    async fn shutdown(&mut self) -> Result<(), String>;
+    async fn shutdown(&mut self, cause: CleanupCause) -> Result<(), String>;
 
     /// The existing supervisor remains the owner while retrying, never a
     /// detached reaper. A replacement cannot start on an incomplete result.
-    async fn shutdown_complete(&mut self) {
-        while let Err(error) = self.shutdown().await {
+    async fn shutdown_complete(&mut self, cause: CleanupCause) {
+        while let Err(error) = self.shutdown(cause).await {
             tracing::warn!(%error, "Generation cleanup incomplete; retaining ownership for retry");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -217,8 +241,8 @@ impl ServiceGeneration for crate::server::BuiltServer {
     async fn finished(&mut self) -> anyhow::Result<()> {
         std::future::pending().await
     }
-    async fn shutdown(&mut self) -> Result<(), String> {
-        self.try_shutdown().await
+    async fn shutdown(&mut self, cause: CleanupCause) -> Result<(), String> {
+        self.try_shutdown_with_cause(cause).await
     }
 }
 
@@ -242,7 +266,7 @@ where
     Rebuild: FnMut() -> RebuildFuture,
     RebuildFuture: std::future::Future<Output = anyhow::Result<G>>,
     Shutdown: Fn() -> ShutdownFuture,
-    ShutdownFuture: std::future::Future<Output = ()>,
+    ShutdownFuture: std::future::Future<Output = Option<ShutdownSignal>>,
 {
     let mut reconnect_attempt = 0u32;
     loop {
@@ -253,12 +277,18 @@ where
             Ok::<(), ConnectError>(())
         };
         tokio::select! {
-            _ = shutdown() => {
-                generation.shutdown_complete().await;
+            signal = shutdown() => {
+                let cause = if let Some(signal) = signal {
+                    signal.log_accepted("steady_state");
+                    CleanupCause::TerminalShutdown
+                } else {
+                    CleanupCause::ShutdownListenerEnded
+                };
+                generation.shutdown_complete(cause).await;
                 return Ok(());
             }
             result = generation.finished() => {
-                generation.shutdown_complete().await;
+                generation.shutdown_complete(CleanupCause::GenerationFinished).await;
                 return result;
             }
             result = probe => match result {
@@ -270,7 +300,12 @@ where
                             let delay = service_reconnect_delay(reconnect_attempt);
                             reconnect_attempt = reconnect_attempt.saturating_add(1);
                             tokio::select! {
-                                _ = shutdown() => anyhow::bail!("shutdown requested"),
+                                signal = shutdown() => {
+                                    if let Some(signal) = signal {
+                                        signal.log_accepted("reconnect_backoff");
+                                    }
+                                    anyhow::bail!("shutdown requested");
+                                }
                                 _ = tokio::time::sleep(delay) => {}
                             }
                             match rebuild().await {
@@ -287,7 +322,7 @@ where
                     }).await?;
                 }
                 Err(error) => {
-                    generation.shutdown_complete().await;
+                    generation.shutdown_complete(CleanupCause::ServiceProbeFailed).await;
                     return Err(error.into());
                 }
             }
@@ -306,16 +341,36 @@ where
     Reconnect: FnOnce() -> ReconnectFuture,
     ReconnectFuture: std::future::Future<Output = anyhow::Result<G>>,
 {
-    generation.shutdown_complete().await;
+    generation
+        .shutdown_complete(CleanupCause::GenerationReplacement)
+        .await;
     let replacement = reconnect().await?;
     *generation = replacement;
     Ok(())
 }
 
-/// Block until the process is asked to stop. Ctrl-C covers foreground and
-/// container use; SIGTERM is what systemd and a test harness's teardown send,
-/// and without it a stop degrades into the kill that follows the timeout.
-pub async fn wait_for_shutdown() {
+/// An actual signal delivered by the shutdown listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownSignal {
+    #[cfg(unix)]
+    Term,
+    CtrlC,
+}
+
+impl ShutdownSignal {
+    fn log_accepted(self, phase: &'static str) {
+        let signal = match self {
+            #[cfg(unix)]
+            Self::Term => "sigterm",
+            Self::CtrlC => "ctrl_c",
+        };
+        tracing::info!(signal, phase, "Service shutdown signal accepted");
+    }
+}
+
+/// Wait for Ctrl-C or (on Unix) SIGTERM. If a listener ends without a signal,
+/// return `None`; callers still leave the wait as they do on a signal.
+pub async fn wait_for_shutdown() -> Option<ShutdownSignal> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -323,18 +378,23 @@ pub async fn wait_for_shutdown() {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to install SIGTERM handler, Ctrl-C only: {e}");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+                return tokio::signal::ctrl_c()
+                    .await
+                    .ok()
+                    .map(|()| ShutdownSignal::CtrlC);
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            result = tokio::signal::ctrl_c() => result.ok().map(|()| ShutdownSignal::CtrlC),
+            result = term.recv() => result.map(|()| ShutdownSignal::Term),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::signal::ctrl_c()
+            .await
+            .ok()
+            .map(|()| ShutdownSignal::CtrlC)
     }
 }
 
@@ -1080,7 +1140,7 @@ eidetica:
         replacement.await.unwrap();
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            ["incomplete", "shutdown", "reconnected"]
+            ["incomplete", "generation_replacement", "reconnected"]
         );
     }
 
@@ -1105,15 +1165,57 @@ eidetica:
             }
         }
 
-        async fn shutdown(&mut self) -> Result<(), String> {
+        async fn shutdown(&mut self, cause: CleanupCause) -> Result<(), String> {
             if self.cleanup_failures > 0 {
                 self.cleanup_failures -= 1;
                 self.events.lock().unwrap().push("incomplete");
                 return Err("injected incomplete cleanup".into());
             }
-            self.events.lock().unwrap().push("shutdown");
+            self.events.lock().unwrap().push(cause.as_str());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_listener_ending_without_a_signal_still_cleans_up() {
+        let logs = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(logs.reopen().unwrap())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let (_dir, shutdown, task, _owner, url) = service_fixture("shared").await;
+        let connected = connect_with(&settings(url, "shared"), ExecutionRole::Client)
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut generation = FinishingGeneration {
+            instance: connected.instance,
+            finish: None,
+            events: events.clone(),
+            cleanup_failures: 0,
+        };
+
+        for (signal, cause) in [
+            (None, "shutdown_listener_ended"),
+            (Some(ShutdownSignal::CtrlC), "terminal_shutdown"),
+        ] {
+            supervise_service(
+                &mut generation,
+                || async { panic!("unexpected reconnect") },
+                || std::future::ready(signal),
+            )
+            .await
+            .unwrap();
+            assert_eq!(events.lock().unwrap().pop(), Some(cause));
+            let output = std::fs::read_to_string(logs.path()).unwrap();
+            assert_eq!(
+                output.contains("Service shutdown signal accepted"),
+                signal.is_some()
+            );
+        }
+        drop(shutdown);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1139,7 +1241,7 @@ eidetica:
                     rebuild_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     async { anyhow::bail!("not expected") }
                 },
-                std::future::pending::<()>,
+                std::future::pending,
             )
             .await
         });
@@ -1151,7 +1253,7 @@ eidetica:
             .unwrap()
             .unwrap();
         assert_eq!(result.unwrap_err().to_string(), "transport exited");
-        assert_eq!(events.lock().unwrap().as_slice(), ["shutdown"]);
+        assert_eq!(events.lock().unwrap().as_slice(), ["generation_finished"]);
         assert_eq!(rebuilds.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(shutdown);
         task.await.unwrap().unwrap();
@@ -1203,9 +1305,10 @@ eidetica:
                     async move {
                         while !*stop_rx.borrow() {
                             if stop_rx.changed().await.is_err() {
-                                return;
+                                return None;
                             }
                         }
+                        Some(ShutdownSignal::CtrlC)
                     }
                 },
             )
@@ -1220,7 +1323,7 @@ eidetica:
             loop {
                 let seen = events.lock().unwrap().clone();
                 if seen.len() >= 2 {
-                    assert_eq!(seen[0], "shutdown");
+                    assert_eq!(seen[0], "generation_replacement");
                     assert!(seen[1..].iter().all(|event| *event == "rebuild-attempt"));
                     break;
                 }
@@ -1257,7 +1360,7 @@ eidetica:
             .unwrap()
             .unwrap();
         result.unwrap();
-        assert_eq!(events.lock().unwrap().last(), Some(&"shutdown"));
+        assert_eq!(events.lock().unwrap().last(), Some(&"terminal_shutdown"));
         drop(finish_tx);
         drop(shutdown);
         task.await.unwrap().unwrap();
