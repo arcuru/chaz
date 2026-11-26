@@ -747,6 +747,15 @@ impl TurnRecorder {
         session.refresh_writer().await?;
         let db = session.database();
         let mut state = fenced.lock().await;
+        let sender = if state.pinned.is_some() {
+            ensure!(
+                !final_entry.sender.trim().is_empty(),
+                "pinned completion requires a nonblank sender"
+            );
+            Some(final_entry.sender)
+        } else {
+            None // Keep the original unpinned receipt shape.
+        };
         let response = state
             .terminal
             .take()
@@ -779,7 +788,7 @@ impl TurnRecorder {
                     response,
                     publication,
                     attempt: self.attempt.attempt_id.clone(),
-                    sender: Some(final_entry.sender.clone()),
+                    sender,
                 },
             },
         )

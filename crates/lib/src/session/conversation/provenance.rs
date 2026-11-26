@@ -738,6 +738,15 @@ fn validate_input(
             let Payload::ControlObservation { value } = &accepted(id)?.payload else {
                 return Err(Error::Integrity("invalid accepted request value".into()));
             };
+            // Each pinned grouping key is bound to one accepted attempt.
+            // Visibility at the observed tips alone does not establish ownership.
+            if conversation.pinned_executions
+                && conversation.operations[&id.operation].branch_id != input.call.branch
+            {
+                return Err(Error::InvalidScope(
+                    "accepted request value belongs to another attempt".into(),
+                ));
+            }
             let valid = match serde_json::from_value::<turn::AcceptedValue>(value.clone())? {
                 turn::AcceptedValue::Instruction(_) | turn::AcceptedValue::BeforeAgent(_) => {
                     is_message

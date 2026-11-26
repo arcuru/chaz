@@ -1,7 +1,13 @@
 use super::*;
 use crate::{
     agent_db::{AgentDb, AgentDbConfig, AgentMeta, create_agent_db},
-    session::conversation::staging::{Observation, Staging, stage_observation},
+    session::{
+        CallInput, CallMessageBinding,
+        conversation::staging::{
+            Accounting, Completion, ModelExecution, NativeResponse, Observation, Payload, Staging,
+            View, stage_observation,
+        },
+    },
 };
 
 const A: &str = "First Agent's original instructions";
@@ -185,6 +191,11 @@ async fn sqlite_pins_and_steering() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(first_call.tools.len(), 1);
+    assert_eq!(first_call.accepted_additions.len(), 2); // the hook and the tool
+    assert_eq!(last_call.accepted_additions, first_call.accepted_additions);
+    assert_eq!(last_call.tools, first_call.tools);
+    let foreign = first_call.clone();
     let second_parents = last_call.observed.frontier.tips();
     assert_eq!(second_parents.len(), 2);
     let tool_result = second_parents
@@ -342,6 +353,143 @@ async fn sqlite_pins_and_steering() {
     assert!(Box::pin(fx.run()).await.is_ok());
     let wire = fx.assert_effects(1, 0, 0).await;
     assert_eq!(wire[0]["messages"][0]["content"], B);
+    let history = Session::history(&db).await.unwrap();
+    let call = history
+        .recorded_call(&fx.call(0), &next.attempt.attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    Box::pin(check_readback_bindings(&db, call, &foreign, &next.attempt)).await;
+}
+
+async fn check_readback_bindings(
+    db: &Database,
+    call: &CallInput,
+    foreign: &CallInput,
+    attempt: &TurnAttempt,
+) {
+    // Separate signed siblings of the valid model result let each readback
+    // vary exactly one binding. The foreign attempt belongs to the same Agent.
+    let hook = foreign
+        .messages
+        .iter()
+        .find_map(|slot| match slot {
+            CallMessageBinding::AcceptedAddition(_) => Some(slot.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let at = &call.observed.frontier;
+    let mut violations = Vec::new();
+    let mut good_model = None;
+    for (label, message, tools) in [
+        ("valid model", None, Vec::new()),
+        ("foreign hook", Some(hook), Vec::new()),
+        ("foreign schema", None, foreign.tools.clone()),
+    ] {
+        let txn = db.new_transaction_at(at).await.unwrap();
+        let staged = Staging::at(db, at, &txn, &call.call.branch).await.unwrap();
+        let op = staged
+            .append(vec![(
+                Payload::NativeModelResponse {
+                    response: NativeResponse {
+                        call: call.call.clone(),
+                        attempt: call.attempt.clone(),
+                        content: Some(BODY.into()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: None,
+                    },
+                },
+                View::NativeExchange,
+            )])
+            .await
+            .unwrap();
+        let response = op.fact_id(0);
+        let mut messages = call.messages.clone();
+        if let Some(slot) = message {
+            messages.insert(1, slot);
+        }
+        stage_observation(
+            &txn,
+            Observation::ModelExecuted {
+                result: Box::new(ModelExecution {
+                    response: response.clone(),
+                    requested_model: call.requested_model.clone(),
+                    cache: call.effective_nonsecret_settings["cache"].clone(),
+                    messages,
+                    tools,
+                    accounting: Box::new(Accounting {
+                        agent: AGENT.into(),
+                        timestamp: Utc::now(),
+                        request_budget_tokens: None,
+                        input_tokens: 12,
+                        output_tokens: 3,
+                        prices: None,
+                    }),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let entry = txn.commit().await.unwrap();
+        let at = Snapshot::from([entry.clone()]);
+        let read = Session::history_at(db, &at).await.unwrap();
+        let result = read.recorded_call_entry(&entry).await;
+        if label == "valid model" {
+            assert!(result.unwrap().is_some());
+            good_model = Some((at, response));
+        } else if !result.is_err_and(|err| err.to_string().contains("another attempt")) {
+            violations.push(label);
+        }
+    }
+    let (at, response) = good_model.unwrap();
+    for sender in [Some(AGENT), None, Some(" \t")] {
+        let txn = db.new_transaction_at(&at).await.unwrap();
+        let staged = Staging::at(db, &at, &txn, &call.call.branch).await.unwrap();
+        let publication = staged.publish(&response, BODY).await.unwrap();
+        stage_observation(
+            &txn,
+            Observation::TurnCompleted {
+                completion: Completion {
+                    response: response.clone(),
+                    publication,
+                    attempt: call.attempt.clone(),
+                    sender: sender.map(str::to_owned),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        txn.get_store::<Table<TurnAttempt>>(crate::session::TURN_ATTEMPTS_STORE)
+            .await
+            .unwrap()
+            .set(
+                &call.attempt,
+                TurnAttempt {
+                    status: crate::session::TurnAttemptStatus::Completed,
+                    completed_at: Some(Utc::now()),
+                    ..attempt.clone()
+                },
+            )
+            .await
+            .unwrap();
+        let cut = Snapshot::from([txn.commit().await.unwrap()]);
+        let read = Session::history_at(db, &cut).await.unwrap();
+        let result = read.display_rows().await;
+        if sender == Some(AGENT) {
+            assert_eq!(result.unwrap().last().unwrap().sender, AGENT);
+        } else if !result.is_err_and(|err| err.to_string().contains("completion sender")) {
+            violations.push(if sender.is_none() {
+                "missing sender"
+            } else {
+                "blank sender"
+            });
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "readback did not reject {violations:?}"
+    );
 }
 
 #[tokio::test]

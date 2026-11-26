@@ -1021,6 +1021,10 @@ async fn check_readback(fx: &Fixture, db: &Database, at: &Snapshot, wire: &[Valu
     let read = Session::history_at(db, at).await.unwrap();
     let inspected = read.inspect_conversation().await.unwrap().unwrap();
     assert!(inspected.issues.is_empty(), "{:?}", inspected.issues);
+    assert_eq!(
+        read.display_rows().await.unwrap().last().unwrap().sender,
+        "assistant"
+    );
     let mut original_additions = Vec::new();
     for (sequence, request) in wire.iter().enumerate() {
         let call = read

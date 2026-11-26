@@ -307,6 +307,16 @@ pub(super) async fn validate_completion(
     entry: &Entry,
     completion: &Completion,
 ) -> Result<chrono::DateTime<chrono::Utc>> {
+    if read.pinned_executions
+        && completion
+            .sender
+            .as_deref()
+            .is_none_or(|sender| sender.trim().is_empty())
+    {
+        return Err(Error::Integrity(
+            "missing or blank completion sender".into(),
+        ));
+    }
     let op = operation_in(read, entry, &completion.publication)?;
     let Payload::NativeModelResponse { response } =
         &super::view::fact(&completion.response, &read.operations)?.payload
