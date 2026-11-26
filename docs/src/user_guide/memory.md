@@ -74,11 +74,11 @@ Lists every bank the agent can see, with the permission level. Always includes `
 
 ### Session excerpt tools
 
-| Tool                      | Arguments                                    | Result                                                                                                                               |
-| ------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `browse_sessions`         | `{}`; optional `cursor`                      | One page of session DB IDs from this Agent's registry that its key can currently read.                                               |
-| `browse_sessions`         | `session_db_id`; optional `cursor`           | At most eight rows in native key order, filtered to chat messages. Returns their IDs, senders, timestamps and untrusted excerpts.    |
-| `import_session_messages` | `session_db_id`, `bank`, `message_ids` (1–8) | Copy those messages to the named standalone bank. The receipt identifies both databases, the selected IDs and how many rows changed. |
+| Tool                      | Arguments                                                  | Result                                                                                                                               |
+| ------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `browse_sessions`         | `{}`; optional `cursor`                                    | One page of session DB IDs from this Agent's registry that its key can currently read.                                               |
+| `browse_sessions`         | `session_db_id`; optional `cursor`                         | At most eight rows in native key order, filtered to chat messages. Returns their IDs, senders, timestamps and untrusted excerpts.    |
+| `import_session_messages` | `session_db_id`, `bank`, `bank_db_id`, `message_ids` (1–8) | Copy those messages to the named standalone bank. The receipt identifies both databases, the selected IDs and how many rows changed. |
 
 ### A copy has its own audience
 
@@ -92,9 +92,9 @@ Only plain `Message` rows from the supported dated session layout are eligible. 
 
 1. In a session where the Agent participates, call `browse_sessions {}`. Take one of the returned IDs. The following examples abbreviate database IDs as `S` and `B` and a message ID as `M`.
 2. Call `browse_sessions {"session_db_id":"S"}`. Select a `message_id` from `untrusted_message_excerpts`. For another page, send the same arguments plus the returned `cursor` (the value of `next_cursor`). An empty page with a cursor means _keep going_: the eight source rows might all be audit records. `null` means end. Pages use a fixed snapshot, not chronological order or a watermark for new messages.
-3. To keep that excerpt in `notes`, call `import_session_messages {"session_db_id":"S","bank":"notes","message_ids":["M"]}`. If the Agent has only Read there, the tool reports `import unavailable; check the selected chat IDs and current session/bank grants`. Choose a bank already writable by this Agent; the tool doesn't upgrade the grant.
+3. Call `list_memory_banks` and take the DB ID (`B`) for `notes`. To keep the excerpt there, call `import_session_messages {"session_db_id":"S","bank":"notes","bank_db_id":"B","message_ids":["M"]}`. If the Agent has only Read there, the tool reports `import unavailable; check the selected chat IDs and current session/bank grants`. Choose a bank already writable by this Agent; the tool doesn't upgrade the grant.
 4. With a writable `notes`, the result is `{"bank_db_id":"B","changed":1,"message_ids":["M"],"session_db_id":"S"}`. Call `recall {"bank":"notes","query":"lighthouse","tags":["session-excerpt"]}` for a message mentioning a lighthouse. Its key is `session:S/message:M` and its value identifies the original sender and timestamp.
-5. Save the source, destination and selected IDs if you need to retry. The same call to the same bank returns `"changed":0` for an unchanged excerpt. If the text was edited, repeat the import to refresh that row. Removal from the source does **not** delete the copy. Cursors expire on restart or eviction (128 retained); restart browsing without a cursor. Refreshing known message IDs needs no cursor. This is a selected copy, not a continuous history sync.
+5. Save the source, destination and selected IDs if you need to retry. Reuse the same bank ID: if `notes` now points elsewhere, the request fails without copying. The same call to the same bank returns `"changed":0` for an unchanged excerpt. If the text was edited, repeat the import to refresh that row. Concurrent imports are independent snapshot copies, not an ordered sync: refresh once after edits and overlapping calls finish. Removal from the source does **not** delete the copy. Cursors expire on restart or eviction (128 retained); restart browsing without a cursor. Refreshing known message IDs needs no cursor. This is a selected copy, not a continuous history sync.
 
 A page or batch limit bounds rows and returned text, not the cost of reading the underlying database. A cold Eidetica service may build derived state from signed history; a large stored row must be read before its excerpt can be cut. Use a service version supporting Read-only cache builds. Bank aliases aren't native table keys: import examines at most 128 references and refuses larger or ambiguous directories rather than guessing a destination. Native recall's bank-wide ranking cost is separate from import.
 
@@ -130,7 +130,7 @@ When the `memory` extension is active, chaz automatically searches the agent's o
 
 1. Up to 5 recent conversation messages are joined newest-first, tokenized, and stopwords removed. The first 10 remaining tokens form the query, giving the current prompt priority.
 2. The agent's own `memory` store is searched with BM25 + cosine hybrid ranking.
-3. Every attached bank (via `/memory attach` or a persistent `/memory grant`) is searched the same way.
+3. Each selected bank the responding Agent can read is searched the same way.
 4. Up to 3 results per store (configurable) are formatted and appended.
 
 ```text
@@ -160,7 +160,7 @@ Attachment selects a bank to search; it does not lend the host's bank key to the
 /memory grant project-conventions chaz read
 ```
 
-The grant writes the bank's AuthSettings and a persistent `MemoryBankRef` into the Agent DB. Explicit `recall` uses this reference; attaching a bank to a session does not create one. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
+The grant writes the bank's AuthSettings and a persistent `MemoryBankRef` into the Agent DB. Explicit `recall` uses this reference. On this version, attach the bank to the session for auto-recall; the legacy selector does not read new Table grants. An attachment alone creates no grant or reference. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
 
 ### Auto-recall configuration
 

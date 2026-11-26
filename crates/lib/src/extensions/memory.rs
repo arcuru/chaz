@@ -389,11 +389,6 @@ impl ContextTail for MemoryContextTail {
                 .await
             {
                 for bref in &bank_refs {
-                    if let Some(ref allowed) = config.auto_recall_banks
-                        && !allowed.iter().any(|a| a == &bref.name)
-                    {
-                        continue;
-                    }
                     bank_names.push(bref.name.clone());
                 }
             }
@@ -403,6 +398,10 @@ impl ContextTail for MemoryContextTail {
                 if !bank_names.contains(bank_name) {
                     bank_names.push(bank_name.clone());
                 }
+            }
+
+            if let Some(allowed) = &config.auto_recall_banks {
+                bank_names.retain(|name| allowed.contains(name));
             }
 
             // Check the receiving Agent, not the hosted bank key. A name in
@@ -419,7 +418,7 @@ impl ContextTail for MemoryContextTail {
                     };
                     let Ok(bank) = self
                         .registry
-                        .open_bank_for_recall(caller, &bank_entry.db_id)
+                        .open_agent_bank(caller, &bank_entry.db_id, Permission::Read)
                         .await
                     else {
                         continue;
@@ -490,6 +489,38 @@ struct MemoryAccessImpl {
     embedder: Option<Arc<dyn Embedder>>,
 }
 
+impl MemoryAccessImpl {
+    async fn open_scope(
+        &self,
+        agent_name: &str,
+        scope: MemoryScope,
+        minimum: Permission,
+    ) -> anyhow::Result<(crate::hosted_index::DbEntry, Database, Option<String>)> {
+        // MemoryAccess is an in-process cap: agent_name is the calling
+        // extension's Agent, not an argument from a model tool call.
+        let caller = self
+            .agent_index
+            .find_by_name(agent_name)
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {agent_name}"))?;
+        let (db, bank_label) = match scope {
+            MemoryScope::Agent => (open_agent_memory_db(&self.registry, &caller).await?, None),
+            MemoryScope::Bank { name } => {
+                let entry = self
+                    .memory_bank_index
+                    .find_by_name(&name)
+                    .ok_or_else(|| anyhow::anyhow!("memory bank not found: {name}"))?;
+                let db = self
+                    .registry
+                    .open_agent_bank(&caller, &entry.db_id, minimum)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("memory bank unavailable: {name}"))?;
+                (db, Some(name))
+            }
+        };
+        Ok((caller, db, bank_label))
+    }
+}
+
 impl MemoryAccess for MemoryAccessImpl {
     fn search<'a>(
         &'a self,
@@ -498,29 +529,8 @@ impl MemoryAccess for MemoryAccessImpl {
         scope: MemoryScope,
     ) -> CapFuture<'a, Vec<MemoryHit>> {
         Box::pin(async move {
-            // MemoryAccess is an in-process cap: agent_name is the calling
-            // extension's Agent, not an argument from a model tool call.
-            let caller = self
-                .agent_index
-                .find_by_name(agent_name)
-                .ok_or_else(|| anyhow::anyhow!("agent not found: {agent_name}"))?;
-            let (db, bank_label) = match scope {
-                MemoryScope::Agent => (open_agent_memory_db(&self.registry, &caller).await?, None),
-                MemoryScope::Bank { name } => {
-                    let entry = self
-                        .memory_bank_index
-                        .find_by_name(&name)
-                        .ok_or_else(|| anyhow::anyhow!("memory bank not found: {name}"))?;
-                    let db = self
-                        .registry
-                        .open_bank_for_recall(&caller, &entry.db_id)
-                        .await
-                        .map_err(|_| {
-                            anyhow::anyhow!("memory bank unavailable for recall: {name}")
-                        })?;
-                    (db, Some(name))
-                }
-            };
+            let (caller, db, bank_label) =
+                self.open_scope(agent_name, scope, Permission::Read).await?;
             let scored = search_memory_structured(
                 &db,
                 MEMORY_STORE,
@@ -556,36 +566,24 @@ impl MemoryAccess for MemoryAccessImpl {
         scope: MemoryScope,
     ) -> CapFuture<'a, ()> {
         Box::pin(async move {
-            let db = match scope {
-                MemoryScope::Agent => {
-                    let entry = self
-                        .agent_index
-                        .find_by_name(agent_name)
-                        .ok_or_else(|| anyhow::anyhow!("agent not found: {agent_name}"))?;
-                    open_agent_memory_db(&self.registry, &entry).await?
-                }
-                MemoryScope::Bank { name } => {
-                    let entry = self
-                        .memory_bank_index
-                        .find_by_name(&name)
-                        .ok_or_else(|| anyhow::anyhow!("memory bank not found: {name}"))?;
-                    let bank = self
-                        .registry
-                        .open_memory_bank(&entry.db_id, Some(&entry.pubkey))
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("no key for memory bank: {name}"))?;
-                    bank.database().clone()
-                }
-            };
+            let (caller, db, bank) = self
+                .open_scope(agent_name, scope, Permission::Write(u32::MAX))
+                .await?;
             let entry = MemoryEntry {
                 key: key.to_string(),
                 value: value.to_string(),
                 timestamp: chrono::Utc::now(),
                 tags: Vec::new(),
             };
-            write_memory_entry(&db, MEMORY_STORE, entry, self.embedder.as_deref())
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            write_memory_entry(
+                &db,
+                MEMORY_STORE,
+                entry,
+                self.embedder.as_deref(),
+                bank.as_ref().map(|_| &caller),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             Ok(())
         })
     }
@@ -1833,6 +1831,7 @@ mod tests {
                 tags: vec![],
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1872,7 +1871,7 @@ mod tests {
             .unwrap();
         let attached = seed_bank(&cmd, "attached", "color", "teal attached bank").await;
         let own = cmd.agent_index.find_by_name("alpha").unwrap();
-        let mut tail = MemoryContextTail {
+        let tail = MemoryContextTail {
             registry: registry.clone(),
             agent_index: cmd.agent_index.clone(),
             memory_bank_index: cmd.memory_bank_index.clone(),
@@ -1918,10 +1917,6 @@ mod tests {
             .unwrap();
         let text = tail.context_tail(&call).await.unwrap().unwrap();
         assert!(!text.contains("teal attached bank"), "{text}");
-        // Attachment eligibility is captured by the native session instance;
-        // exercise removal by constructing the next instance's attachment list.
-        tail.session_attached_banks
-            .retain(|name| name != "eligible");
         let adb = registry
             .open_agent_db(&own.db_id, Some(&own.pubkey))
             .await
@@ -2007,6 +2002,12 @@ mod tests {
                 .is_err()
         );
         assert_text(cmd.grant_cmd("shared alpha read").await, "Read");
+        assert!(
+            access
+                .remember("alpha", "cannot-write", "read only", scope.clone())
+                .await
+                .is_err()
+        );
         let hits = access
             .search("alpha", "passphrase", scope.clone())
             .await

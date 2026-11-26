@@ -194,6 +194,7 @@ impl BrowseSessions {
 #[serde(deny_unknown_fields)]
 struct Import {
     bank: String,
+    bank_db_id: String,
     session_db_id: String,
     message_ids: Vec<String>,
 }
@@ -208,6 +209,12 @@ impl ImportSessionMessages {
         let (actor, here) = caller(ctx, &self.0).await?;
         let source = self.0.open_index_source(actor, &args.session_db_id).await?;
         let bank = self.0.open_index_bank(actor, &args.bank).await?;
+        // Bind the caller's selection before opening a transaction: a name
+        // can be rebound to a different writable bank between attempts.
+        ensure!(
+            bank.root_id().to_string() == args.bank_db_id,
+            "bank reference changed"
+        );
         let snapshot = Session::legacy_entry_snapshot(&source).await?;
         let read = source.new_transaction_at(&snapshot).await?;
         let messages = read.get_store::<Table<SessionEntry>>("entries").await?;
@@ -299,9 +306,10 @@ impl Tool for ImportSessionMessages {
                 "type": "object",
                 "properties": {
                     "session_db_id": {"type": "string"}, "bank": {"type": "string"},
+                    "bank_db_id": {"type": "string", "description": "Destination ID from list_memory_banks. Keep this ID on retry."},
                     "message_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": PAGE}
                 },
-                "required": ["session_db_id", "bank", "message_ids"], "additionalProperties": false
+                "required": ["session_db_id", "bank", "bank_db_id", "message_ids"], "additionalProperties": false
             }),
         }
     }
@@ -319,7 +327,9 @@ impl Tool for ImportSessionMessages {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let args = serde_json::from_value(arguments).map_err(|_| {
-                ToolError::InvalidArgument("expected session_db_id, bank and message_ids".into())
+                ToolError::InvalidArgument(
+                    "expected session_db_id, bank, bank_db_id and message_ids".into(),
+                )
             })?;
             self.import(args, ctx).await.map(|v| v.to_string()).map_err(|_| "import unavailable; check the selected chat IDs and current session/bank grants".into())
         })

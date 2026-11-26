@@ -302,6 +302,16 @@ async fn recall_with_bank_requires_current_direct_read_despite_reference() {
         .grant_on_memory_bank(&bank_root, &caller.pubkey, "alpha", BankPermission::Read)
         .await
         .unwrap();
+    // A stale Write reference cannot lend the host's bank key to the caller.
+    assert!(
+        remember
+            .execute(
+                serde_json::json!({"key":"k", "value":"v", "bank":"patrick"}),
+                &ctx
+            )
+            .await
+            .is_err()
+    );
     let found = recall.execute(args.clone(), &ctx).await.unwrap();
     assert!(
         found.contains("boss"),
@@ -326,7 +336,7 @@ async fn recall_with_bank_requires_current_direct_read_despite_reference() {
         ))),
     );
     let error = racing_recall.execute(args.clone(), &ctx).await.unwrap_err();
-    assert!(error.to_string().contains("current Read grant"), "{error}");
+    assert!(error.to_string().contains("current bank grant"), "{error}");
     assert!(recall.execute(args, &ctx).await.is_err());
 
     // And own memory is untouched (self-remember was never called).
@@ -351,8 +361,9 @@ async fn remember_with_read_only_bank_errors() {
     )
     .await;
 
-    let remember = Remember::new(registry.clone(), index, None);
-    let ctx = make_ctx("alpha", session);
+    let mut ctx = make_ctx("alpha", session);
+    ctx.agent_identity = index.find_by_name("alpha");
+    let remember = Remember::new(registry, index, None);
     let err = remember
         .execute(
             serde_json::json!({ "key": "k", "value": "v", "bank": "readonly" }),
@@ -852,7 +863,7 @@ async fn recall_with_failing_query_embedder_falls_back_to_bm25() {
 
 #[tokio::test]
 async fn bank_remember_with_embedder_populates_embedding_subtree() {
-    // The bank path uses `do_remember(..., embedder=Some(...))`
+    // The bank writer receives the configured embedder
     // exactly like self memory; verify by writing into a bank and
     // reading the bank's `embeddings:<model_id>` subtree directly.
     let (_instance, registry, index, session) = fixture("alpha").await;
@@ -1221,7 +1232,7 @@ async fn exercise_session_copy(service: bool) {
             .is_err()
     );
     let bank_root = eidetica::entry::ID::parse(&bank_id).unwrap();
-    let args = json!({"session_db_id":source_id.0,"bank":"notes","message_ids":[selected]});
+    let args = json!({"session_db_id":source_id.0,"bank":"notes","bank_db_id":bank_id,"message_ids":[selected]});
     owner
         .grant_on_memory_bank(&bank_root, &actor.pubkey, "alpha", BankPermission::Read)
         .await
@@ -1231,8 +1242,11 @@ async fn exercise_session_copy(service: bool) {
         .grant_on_memory_bank(&bank_root, &actor.pubkey, "alpha", BankPermission::Write)
         .await
         .unwrap();
-    let bad_batch =
-        json!({"session_db_id": source_id.0, "bank": "notes", "message_ids": [selected, "absent"]});
+    // The name still resolves to a writable bank, but not the bank the caller selected.
+    let mut rebound = args.clone();
+    rebound["bank_db_id"] = json!(here_id);
+    assert!(import.execute(rebound, &ctx).await.is_err());
+    let bad_batch = json!({"session_db_id": source_id.0, "bank": "notes", "bank_db_id":bank_id, "message_ids": [selected, "absent"]});
     assert!(import.execute(bad_batch, &ctx).await.is_err());
     // No prefix of the failed batch was committed.
     for expect in [1, 0] {
@@ -1285,7 +1299,7 @@ async fn exercise_session_copy(service: bool) {
     assert!(
         import
             .execute(
-                json!({"session_db_id":here_id, "bank":"notes", "message_ids":[here_msg.as_str()]}),
+                json!({"session_db_id":here_id, "bank":"notes", "bank_db_id":bank_id, "message_ids":[here_msg.as_str()]}),
                 &ctx
             )
             .await
@@ -1459,7 +1473,8 @@ async fn session_excerpt_growth() {
         let next_us = t.elapsed().as_micros();
         assert!(next.contains("row-000008"));
         let id = format!("row-{:06}", rows - 8);
-        let copy = json!({"bank":"notes","session_db_id":source.0,"message_ids":[id]});
+        let copy =
+            json!({"bank":"notes","bank_db_id":bank,"session_db_id":source.0,"message_ids":[id]});
         let mut imports = vec![];
         for expected in [1, 0] {
             let t = Instant::now();

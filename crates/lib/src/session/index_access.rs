@@ -39,21 +39,22 @@ impl SessionRegistry {
             .map_err(|_| anyhow::anyhow!(UNAVAILABLE))
     }
 
-    /// Open a selected bank as the receiving Agent. The selection (attachment,
+    /// Open a selected memory table as the acting Agent. The selection (attachment,
     /// name, or reference) is a locator, never a grant.
-    pub(crate) async fn open_bank_for_recall(
+    pub(crate) async fn open_agent_bank(
         &self,
         caller: &DbEntry,
         root: &ID,
+        minimum: Permission,
     ) -> Result<Database> {
         let (signer, _) = self.index_actor(caller).await?;
         // Existing Agent-as-bank references can recall the same memory table.
-        // Imports, unlike reads, target standalone banks only.
+        // Session imports target standalone banks only.
         self.open_index_db(
             &signer,
             root,
             &[db_kind::KIND_BANK, db_kind::KIND_AGENT],
-            Permission::Read,
+            minimum,
         )
         .await
     }
@@ -243,13 +244,13 @@ mod tests {
         // Recall preserves Agent-as-bank references but cannot reinterpret a
         // readable session as a bank. Import has a stricter target kind.
         let notes = registry
-            .open_bank_for_recall(&caller, &caller.db_id)
+            .open_agent_bank(&caller, &caller.db_id, Permission::Read)
             .await
             .unwrap();
         assert_eq!(notes.auth_identity(), Some(&direct));
         assert!(
             registry
-                .open_bank_for_recall(&caller, source.root_id())
+                .open_agent_bank(&caller, source.root_id(), Permission::Read)
                 .await
                 .is_err()
         );
