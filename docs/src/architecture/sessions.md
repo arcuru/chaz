@@ -8,7 +8,7 @@ Sessions are the core data model in chaz. Every conversation -- whether from a M
 enum EntryType {
     Message,    // Chat message (from any participant)
     BridgeEvent, // Versioned external observation, outbox request, or receipt
-    Directive,  // Task instruction (from spawn_agent, scheduler, system)
+    Directive,  // Task instruction (e.g. the submitted Agent job or Worker task)
     ToolCall,   // Record of a tool invocation (audit trail)
     ToolResult, // Record of a tool result (audit trail)
     Ack,        // Agent is processing (thinking indicator)
@@ -297,8 +297,10 @@ peer-local session index as a durable adoption queue. It proves that the shared
 user's default key has write authority on the new session, binds that signing
 identity, claims the runtime, and registers the ordinary watch/catch-up path.
 The executor scans existing rows on startup and rescans after index writes, so
-a queued turn survives notification loss and executor restart. This path does
-not add transport exposure metadata; bridge-created sessions continue through
+a queued ordinary turn survives notification loss and executor restart. This
+scan skips `spawn:` children: their narrowed runtime is installed by the
+spawning executor, not reconstructed from the catalog. This path does not
+add transport exposure metadata; bridge-created sessions continue through
 the agent registry's `exposed_on` adoption path.
 
 An interrupted attempt is deliberately not replayed. Model and tool work may
@@ -577,13 +579,13 @@ The request and terminal receipt each occupy one `v1` slot in their existing Doc
 
 After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten turns hold runtime permits for actual execution; accepted jobs wait **queued before starting an attempt** when capacity is full. An in-Agent `job_wait` yields its permit during observation without releasing its processing reservation, attempt, or execution branch. It reacquires before result hooks, further tools, or model requests, including after tool errors and timeouts. The execution branch's yield watcher covers observation and reacquisition; a fresh ordering check after reacquisition prevents continuation once an earlier branch has been observed. Cancellation drops the turn's permit or pending acquisition. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 
-**Checkpointed waits.** Before a `job_wait` that ends its model response observes, the runtime commits a versioned `JobWaitCheckpoint` row to the parent session DB's `job_wait_checkpoints` store. The row key is attempt, model sequence and call index, so rewriting the same call cannot add a row. The row records the request and attempt, Agent name, call ID and post-hook arguments, child handle, the session snapshot the turn's context came from, and an absolute deadline. The runtime gives the tool that same deadline (`ToolContext::observation_deadline`). A turn with **Approve all** or extension-injected pre-turn messages writes no row, because the loader could not restore that state.
+**Checkpointed waits.** For an eligible final `job_wait` in a recorded batch, the runtime commits a versioned `JobWaitCheckpoint` row to the parent session DB's `job_wait_checkpoints` store. The row key is attempt, model sequence and call index, so rewriting the same call cannot add a row. The row records the request and attempt, Agent name, call ID and post-hook arguments, child handle, the session snapshot the turn's context came from, and an absolute deadline. The runtime gives the tool that same deadline (`ToolContext::observation_deadline`). A turn with **Approve all** or extension-injected pre-turn messages writes no row, because the loader could not restore that state.
 
 On a wake, including the one adoption sends after a restart, the executor examines interrupted requests in session order. It resumes one only when `plan_job_wait_resume` accepts it: the attempt's records are contiguous from sequence 0 for one attempt and request; every earlier model response is non-terminal and followed by exactly its paired results; and the last response's final call is the checkpointed `job_wait` with no result. The resumed attempt keeps its attempt ID and its context snapshot, and appends after its last sequence. Earlier results are reused with the exact content the live loop appended. Only the wait runs, under the remaining deadline and policy budget, and the loop then continues.
 
 **In-process suspension.** At an eligible checkpoint, the runtime returns a suspended outcome without observing the tool or firing end hooks. The server drops the turn task, loaded `Session`, messages, tool context, recorder and capacity permit. Only a bounded descriptor (attempt ID, child DB ID and absolute wake deadline) survives, alongside the in-memory processing reservation and sticky stop signal. New turns and commands cannot overtake it. Entered `job_waits` activity remains visible; it is not a liveness or ownership claim.
 
-A child-write hint accelerates a persisted status recheck. Registration precedes the initial recheck, and periodic reconciliation and the absolute deadline cover missing or duplicate hints. A terminal or interrupted child, an unavailable handle, an expired observation/policy deadline, or a stop makes the suspension actionable. The capacity waiter holds no loaded context. After normal capacity admission, the executor rechecks the attempt, checkpoint, execution ordering and current authority, then uses the same snapshot-backed loader as a restart. A job continuation records a new branch under the same attempt and process incarnation, naming its predecessor and checkpoint. Duplicate hints cannot install another readmission task.
+A child-write hint accelerates a persisted status recheck. Registration precedes the initial recheck, and periodic reconciliation and the absolute deadline cover missing or duplicate hints. A terminal or interrupted child, an unavailable handle, an expired observation/policy deadline, or a stop makes the suspension actionable. The capacity waiter holds no loaded context. After normal capacity admission, the executor rechecks the attempt, checkpoint, execution ordering and current authority, then uses the same snapshot-backed loader as a restart. If the waiting parent is itself an Agent job, its continuation records a new branch under the same attempt and process incarnation, naming its predecessor and checkpoint. Duplicate hints cannot install another readmission task.
 
 Unloading is refused when the caller requires a Worker completion channel, the wait has unresolved approval or **Approve all**, the batch has later calls, or pre-turn/boundary-injected input cannot be restored. Active before-start, tool-call, tool-result or end hooks are conservatively treated as holding unrecorded turn state: such waits stay resident and log why, while retaining capacity yield. Unreadable active-hook state also keeps the turn resident; an empty fallback set cannot prove suspension is safe. Boundary input conservatively prevents unloading, but persisted steering still checkpoints and restores after restart. There is no hook/approval carryover policy here. A persisted user stop targeting an unloaded attempt pairs its pending call with a cancelled result and commits the normal stop terminal, without invoking a model, tool or hook or cancelling the child.
 
@@ -601,7 +603,9 @@ A session joins this protocol through an `execution_protocol` activation row. A 
 
 Session affinity is a deferred interface only: a placement requirement a session or extension could someday state, not a permission grant and not a liveness signal. Nothing reads, enforces or configures it in this release. The pinned child authority cannot exceed the parent's admitted ceiling; `spawn_worker` is excluded from Agent-job delegation.
 
-`spawn_worker` is a separate Worker-template invocation, synchronous by default, with no durable Agent-job handle or Agent identity. Its child session must not be treated as an accepted Agent job.
+**Worker children.** A `spawn_worker` call invokes a template under the calling Agent. The child DB holds the submitted Directive, attempt, transcript and outcome; the parent DB links the native call to that Directive and records its own tool result. The child is not admitted as an Agent job and has no `job_result` receipt.
+
+The default call yields execution capacity after submission and waits for a notification. On success it returns the linked child reply. With `async: true` the tool returns the child DB ID instead. A `worker_wait` in the same invocation can observe its outcome; a later turn cannot use that ID to join it. Neither kind of Worker wait saves a `JobWaitCheckpoint`. A connected or reopened client can inspect the persisted evidence without restarting the child or continuing the parent's model loop. See [Inspecting Worker Sessions](../design/worker_sessions.md) for the order of commits and the limits after restart.
 
 ### Local job monitoring and next-call input
 
