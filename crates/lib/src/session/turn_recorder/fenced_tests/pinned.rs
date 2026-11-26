@@ -606,3 +606,186 @@ async fn pinned_fixture_refuses_result_and_tools_after_live_revocation() {
     }))
     .await;
 }
+
+#[tokio::test]
+async fn pinned_fixture_peer_agent_is_named_peer_not_own_history() {
+    tokio::task::unconstrained(Box::pin(sequential_agents())).await;
+}
+
+/// Run one pinned turn to publication. Returns the fixture for wire evidence.
+async fn run_pinned(
+    instance: &Instance,
+    session: &Arc<Mutex<Session>>,
+    agent: &AgentDb,
+    display: &str,
+    question: &str,
+    with_tool: bool,
+    responder: impl wiremock::Respond + 'static,
+) -> Fixture {
+    let prepared = Session::prepare_pinned_fixture(session, agent, message("user", question))
+        .await
+        .unwrap();
+    let cancel = TurnCancel::new();
+    let (_, recorder) = Box::pin(Session::start_pinned_fixture(
+        session.clone(),
+        &prepared,
+        agent.clone(),
+        display.into(),
+        cancel.clone(),
+    ))
+    .await
+    .unwrap();
+    let fx = Box::pin(Fixture::with_recorder(
+        instance.clone(),
+        session.clone(),
+        Arc::new(recorder),
+        with_tool,
+        None,
+        cancel,
+        responder,
+    ))
+    .await;
+    let outcome = Box::pin(fx.run()).await.unwrap();
+    let mut guard = session.lock().await;
+    Box::pin(
+        fx.recorder
+            .complete(&mut guard, Some(message(display, &outcome.body)), None),
+    )
+    .await
+    .unwrap();
+    drop(guard);
+    fx
+}
+
+async fn sequential_agents() {
+    let disk = tempfile::tempdir().unwrap();
+    let (instance, db) = sqlite_fixture_db(&disk).await;
+    let first = agent(&instance, "first", A).await;
+    let other = agent(&instance, "other", OTHER).await;
+    let session = session(&db).await;
+    Session::fixture_pin_agent(&session, &first, false)
+        .await
+        .unwrap();
+    Session::fixture_pin_agent(&session, &other, false)
+        .await
+        .unwrap();
+
+    // A uses its tool, then publishes. Its own follow-up still replays the
+    // native exchange, so the hiding below is reader-specific.
+    let a = Box::pin(run_pinned(
+        &instance,
+        &session,
+        &first,
+        AGENT,
+        "2 + 2",
+        true,
+        |req: &Request| stub_response(true, req),
+    ))
+    .await;
+    let a_wire = a.assert_effects(2, 1, 1).await;
+    assert!(
+        a_wire[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["tool_calls"][0]["id"] == "wire-1")
+    );
+
+    let b = Box::pin(run_pinned(
+        &instance,
+        &session,
+        &other,
+        "other",
+        Q_CAPITAL,
+        false,
+        two_answer_response,
+    ))
+    .await;
+    let b_wire = b.assert_effects(1, 0, 0).await;
+    let messages = b_wire[0]["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], OTHER);
+    assert!(
+        messages.iter().all(|m| m["role"] != "assistant"
+            && m["role"] != "tool"
+            && m.get("tool_calls").is_none()),
+        "{messages:#?}"
+    );
+    assert!(!serde_json::to_string(messages).unwrap().contains("wire-1"));
+    let users: Vec<_> = messages[1..]
+        .iter()
+        .map(|m| {
+            assert_eq!(m["role"], "user");
+            m["content"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(users.len(), 3, "{users:?}");
+    assert_eq!(users[0], "2 + 2");
+    let peer: Value = serde_json::from_str(users[1]).unwrap();
+    assert_eq!(
+        peer,
+        json!({"kind": "local_message", "sender": AGENT, "body": BODY})
+    );
+    assert_eq!(users[2], Q_CAPITAL);
+    let (root, first_id) = (db.root_id().clone(), first.id());
+    drop((a, b, session, first, other, db, instance));
+
+    let reopened = reopen(&disk).await;
+    let user = reopened
+        .login_account("test", "test-password")
+        .await
+        .unwrap();
+    let db = user.open_database(&root).await.unwrap();
+    let history = Session::history(&db).await.unwrap();
+    let rows: Vec<_> = history
+        .display_rows()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.sender, row.content))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("user", "2 + 2"),
+            (AGENT, BODY),
+            ("user", Q_CAPITAL),
+            ("other", A_CAPITAL),
+        ]
+        .map(|(s, c)| (s.to_string(), c.to_string()))
+    );
+    // The reopened context still renders the same peer view for the next
+    // request, and A's own view keeps its native tool exchange.
+    let current = super::pinned::session(&db).await;
+    let first = AgentDb::from_database(user.open_database(&first_id).await.unwrap());
+    let c = Box::pin(run_pinned(
+        &reopened,
+        &current,
+        &first,
+        AGENT,
+        "Anything else?",
+        false,
+        |req: &Request| stub_response(false, req),
+    ))
+    .await;
+    let wire = c.assert_effects(1, 0, 0).await;
+    let messages = wire[0]["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["content"], A);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["tool_calls"][0]["id"] == "wire-1")
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["content"] == BODY)
+    );
+    let peer = messages
+        .iter()
+        .filter_map(|m| serde_json::from_str::<Value>(m["content"].as_str()?).ok())
+        .find(|m| m["kind"] == "local_message")
+        .unwrap();
+    assert_eq!(peer["sender"], "other");
+    assert_eq!(peer["body"], A_CAPITAL);
+}

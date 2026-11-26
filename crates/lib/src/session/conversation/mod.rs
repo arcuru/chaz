@@ -224,8 +224,44 @@ impl ConversationRead {
     }
 
     pub(super) fn context(&self) -> Result<SessionContextView> {
+        self.context_with(None)
+    }
+
+    /// Context for one pinned Agent: other Agents' executions appear only as
+    /// their named publications, never as this Agent's own turns.
+    pub(super) fn context_for(&self, agent: &str) -> Result<SessionContextView> {
+        if !self.pinned_executions {
+            return Err(ConversationError::Unsupported(
+                "Agent reader without pinned executions".into(),
+            ));
+        }
+        self.context_with(Some(&view::Reader {
+            agent,
+            authors: self.authors(),
+            names: &self.provenance.senders,
+        }))
+    }
+
+    /// Operation ID → Agent DB ID, through each accepted input's own pin.
+    fn authors(&self) -> BTreeMap<&str, &str> {
+        let branches: BTreeMap<_, _> = self
+            .provenance
+            .inputs
+            .values()
+            .filter_map(|(_, input)| {
+                let config = self.pins.config(input.pin.as_ref()?)?;
+                Some((input.branch.as_str(), config.database.as_str()))
+            })
+            .collect();
+        self.operations
+            .iter()
+            .filter_map(|(id, op)| Some((id.as_str(), *branches.get(op.branch_id.as_str())?)))
+            .collect()
+    }
+
+    fn context_with(&self, reader: Option<&view::Reader<'_>>) -> Result<SessionContextView> {
         Ok(SessionContextView {
-            groups: self.effective()?.context_groups()?,
+            groups: self.effective()?.context_groups(reader)?,
             contributions: self.legacy.contributions.clone(),
             read_only: true,
             receipts: self.legacy.receipts.clone(),
@@ -237,7 +273,7 @@ impl ConversationRead {
     pub(super) fn display_rows(&self) -> Result<Vec<DisplayRow>> {
         Ok(self
             .effective()?
-            .display_rows(&self.provenance.reply_targets))
+            .display_rows(&self.provenance.reply_targets, &self.provenance.senders))
     }
 
     pub(super) fn recorded_call(&self, call: &CallId, attempt: &str) -> Result<Option<&CallInput>> {

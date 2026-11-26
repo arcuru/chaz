@@ -338,7 +338,12 @@ impl TurnRecorder {
         };
         let txn = &exec.txn;
         let staged = Staging::at(db, &exec.at, txn, &id.branch).await?;
-        let groups = staged.context()?.groups;
+        // Check each slot against the rendering this Agent actually received.
+        let groups = match &state.pinned {
+            Some(pin) => staged.context_for(&pin.agent.id().to_string())?,
+            None => staged.context()?,
+        }
+        .groups;
         let rendered: BTreeMap<_, _> = groups
             .into_iter()
             .filter_map(|group| match group.body {
@@ -774,6 +779,7 @@ impl TurnRecorder {
                     response,
                     publication,
                     attempt: self.attempt.attempt_id.clone(),
+                    sender: Some(final_entry.sender.clone()),
                 },
             },
         )

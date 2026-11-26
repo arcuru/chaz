@@ -5,7 +5,7 @@ use crate::{agent_db::AgentDb, session::RecordRef};
 use eidetica::entry::ID;
 
 pub(super) struct PinnedTurn {
-    agent: AgentDb,
+    pub(super) agent: AgentDb,
     config: RecordRef,
     pub(super) model: Option<Execution>,
     pub(super) selection: Option<crate::session::CallInput>,
@@ -82,7 +82,7 @@ impl TurnRecorder {
                 fresh.sources.push(source.clone());
             }
         }
-        for group in staged.context()?.groups {
+        for group in staged.context_for(&pin.agent.id().to_string())?.groups {
             let HistoryBody::Recorded { messages, .. } = group.body else {
                 anyhow::bail!("pinned fixture requires signed context");
             };

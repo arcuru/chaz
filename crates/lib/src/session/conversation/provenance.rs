@@ -259,6 +259,8 @@ pub(super) struct Evidence {
     pub applied_compactions: BTreeSet<String>,
     pub completed_at: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     pub reply_targets: BTreeMap<String, RepresentationId>,
+    /// Publication operation ID → the completing Agent's display sender.
+    pub senders: BTreeMap<String, String>,
 }
 
 pub(super) async fn read(
@@ -430,7 +432,8 @@ pub(super) async fn read(
                             conversation,
                             ancestry,
                             fenced,
-                        );
+                        )
+                        .and_then(|()| own_exchanges(conversation, &inputs, input));
                         if fenced && result.is_ok() {
                             accepted_values.extend(
                                 input
@@ -592,6 +595,11 @@ pub(super) async fn read(
                 evidence
                     .reply_targets
                     .insert(completion.publication.clone(), trigger);
+                if let Some(sender) = &completion.sender {
+                    evidence
+                        .senders
+                        .insert(completion.publication.clone(), sender.clone());
+                }
             }
         }
     }
@@ -750,6 +758,43 @@ fn validate_input(
     Ok(())
 }
 
+/// A pinned call may replay only its own Agent's native model/tool rows.
+/// Another Agent's execution is visible to it as a publication only.
+fn own_exchanges(
+    conversation: &super::ConversationRead,
+    inputs: &BTreeMap<String, (&eidetica::entry::Entry, turn::AcceptedInput)>,
+    input: &CallInput,
+) -> Result<()> {
+    let agent = |branch: &str| {
+        inputs
+            .values()
+            .find(|(_, accepted)| accepted.branch == branch)
+            .and_then(|(_, accepted)| conversation.pins.config(accepted.pin.as_ref()?))
+            .map(|config| &config.database)
+    };
+    let Some(reader) = agent(&input.call.branch) else {
+        return Ok(()); // unpinned fenced fixture: single-Agent by contract
+    };
+    for id in &input.representations {
+        let op = conversation
+            .operations
+            .get(&id.operation)
+            .ok_or_else(|| Error::Missing("selected operation".into()))?;
+        let output = op
+            .outputs
+            .get(id.index as usize)
+            .ok_or_else(|| Error::Missing("selected representation".into()))?;
+        if matches!(output.view, View::NativeExchange | View::ToolResult)
+            && agent(&op.branch_id) != Some(reader)
+        {
+            return Err(Error::InvalidScope(
+                "call replays another Agent's native exchange".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate_selection(
     selected: &view::ConversationView,
     mut ids: &[RepresentationId],
@@ -757,7 +802,7 @@ pub(super) fn validate_selection(
 ) -> Result<()> {
     use crate::session::history::HistoryBody;
     let mut slots = messages.iter().map(representation_slot);
-    for group in selected.context_groups()? {
+    for group in selected.context_groups(None)? {
         let Some(head) = ids.first() else { break };
         if group.representation.as_ref() != Some(head) {
             continue;

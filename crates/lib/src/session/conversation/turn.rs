@@ -40,6 +40,9 @@ pub(in crate::session) struct Completion {
     pub response: FactId,
     pub publication: String,
     pub attempt: String,
+    /// Display author of the publication; identity stays the input's pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 /// Irreducible inputs of this narrow writer; no raw request or authority.

@@ -348,16 +348,93 @@ pub(super) fn effective(
     Ok(view)
 }
 
+/// The Agent a model request is built for. Authorship comes from each
+/// execution's accepted input pin, never from a sender string or role label.
+pub(super) struct Reader<'a> {
+    pub agent: &'a str,
+    /// Operation ID → authoring Agent DB ID.
+    pub authors: BTreeMap<&'a str, &'a str>,
+    /// Publication operation ID → its recorded display sender.
+    pub names: &'a BTreeMap<String, String>,
+}
+
+/// How a reader sees one execution row.
+enum Seen<'a> {
+    Own,
+    /// Another Agent's private model/tool exchange.
+    Hidden,
+    /// Another Agent's publication, rendered as a named peer message.
+    Peer(&'a str),
+}
+
+impl Reader<'_> {
+    fn sees(&self, row: &VisibleRepresentation) -> Result<Seen<'_>> {
+        let RepresentationSource::Conversation { representation, .. } = &row.source else {
+            return Ok(Seen::Own);
+        };
+        let execution = matches!(
+            representation.view,
+            View::NativeExchange | View::ToolResult | View::Message(MessageRole::Assistant)
+        );
+        if !execution {
+            return Ok(Seen::Own);
+        }
+        let author = self
+            .authors
+            .get(row.id.operation.as_str())
+            .ok_or_else(|| ConversationError::Missing("execution author".into()))?;
+        if *author == self.agent {
+            return Ok(Seen::Own);
+        }
+        if representation.view != View::Message(MessageRole::Assistant) {
+            return Ok(Seen::Hidden);
+        }
+        self.names
+            .get(&row.id.operation)
+            .map(|name| Seen::Peer(name))
+            .ok_or_else(|| ConversationError::Missing("peer publication sender".into()))
+    }
+}
+
 impl ConversationView {
-    pub(super) fn context_groups(&self) -> Result<Vec<crate::session::HistoryGroup>> {
+    pub(super) fn context_groups(
+        &self,
+        reader: Option<&Reader<'_>>,
+    ) -> Result<Vec<crate::session::HistoryGroup>> {
         use crate::session::{EntryType, HistoryGroup, history::HistoryBody};
         self.validate_exchanges(true)?;
-        let mut groups = Vec::new();
-        let mut visible = self
+        let mut rows = Vec::new();
+        for row in self
             .representations
             .iter()
-            .filter(|row| !row.is_audit_only());
-        while let Some(first) = visible.next() {
+            .filter(|row| !row.is_audit_only())
+        {
+            // The whole view is complete (validated above), so hiding a
+            // peer's native rows never splits a unit the reader keeps.
+            match reader.map(|reader| reader.sees(row)).transpose()? {
+                None | Some(Seen::Own) => rows.push((row, None)),
+                Some(Seen::Hidden) => {}
+                Some(Seen::Peer(sender)) => rows.push((row, Some(sender))),
+            }
+        }
+        let mut groups = Vec::new();
+        let mut visible = rows.into_iter();
+        while let Some((first, peer)) = visible.next() {
+            if let Some(sender) = peer {
+                let [(RuntimeMessage::Assistant(body), id)] = &render_unit(&[first])?[..] else {
+                    return Err(ConversationError::Malformed("peer publication".into()));
+                };
+                let text =
+                    serde_json::json!({"kind": "local_message", "sender": sender, "body": body});
+                groups.push(HistoryGroup {
+                    body: HistoryBody::Recorded {
+                        kind: EntryType::Message,
+                        messages: vec![(RuntimeMessage::User(text.to_string()), id.clone())],
+                    },
+                    representation: Some(first.id.clone()),
+                });
+                continue;
+            }
             let mut unit = vec![first];
             let body = match &first.source {
                 RepresentationSource::Legacy(row) => {
@@ -370,7 +447,14 @@ impl ConversationView {
                     if representation.view == View::NativeExchange
                         && let Payload::NativeModelResponse { response } = &fact.payload
                     {
-                        unit.extend(visible.by_ref().take(response.tool_calls.len()));
+                        // Own tool results follow their response; a peer's
+                        // were hidden together with that peer's response.
+                        unit.extend(
+                            visible
+                                .by_ref()
+                                .take(response.tool_calls.len())
+                                .map(|(row, _)| row),
+                        );
                     }
                     let kind = match representation.view {
                         View::Directive => EntryType::Directive,
@@ -395,6 +479,7 @@ impl ConversationView {
     pub(super) fn display_rows(
         &self,
         reply_targets: &BTreeMap<String, RepresentationId>,
+        senders: &BTreeMap<String, String>,
     ) -> Vec<crate::session::history::DisplayRow> {
         use crate::session::{EntryType, history::DisplayRow};
         let mut user_inputs = BTreeMap::new();
@@ -402,6 +487,8 @@ impl ConversationView {
         self.representations
             .iter()
             .filter_map(|row| {
+                // A completed publication carries its Agent's display name.
+                let published = senders.get(&row.id.operation).map(String::as_str);
                 let (sender, content, kind) = match &row.source {
                     RepresentationSource::Legacy(row) => {
                         return Some(row.group.entry.clone().into());
@@ -421,7 +508,7 @@ impl ConversationView {
                             Payload::PublishedBody { text } | Payload::Input { text, .. },
                         ) => (
                             match role {
-                                MessageRole::Assistant => "assistant",
+                                MessageRole::Assistant => published.unwrap_or("assistant"),
                                 MessageRole::User => "user",
                             },
                             text,
@@ -430,7 +517,11 @@ impl ConversationView {
                         (
                             View::Message(MessageRole::Assistant),
                             Payload::NativeModelResponse { response },
-                        ) => ("assistant", response.content.as_ref()?, EntryType::Message),
+                        ) => (
+                            published.unwrap_or("assistant"),
+                            response.content.as_ref()?,
+                            EntryType::Message,
+                        ),
                         (View::Directive, Payload::TransformationOutput { text }) => {
                             ("history", text, EntryType::Directive)
                         }

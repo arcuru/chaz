@@ -222,6 +222,10 @@ impl<'a> Staging<'a> {
         self.read.context()
     }
 
+    pub fn context_for(&self, agent: &str) -> Result<SessionContextView> {
+        self.read.context_for(agent)
+    }
+
     async fn stage(&self, op: &Operation) -> Result<()> {
         view::validate_at_observed(op, &self.read.operations, &self.read.legacy)?;
         atom_in(&self.txn.get_store::<ConversationStore>(STORE).await?, op).await

@@ -169,6 +169,18 @@ in the request even when a correction landed between its members.
 derives the request cut from its signed parents. The v1 representation member
 IDs identify context selections within Entries, not separate execution branches.
 
+Each request is rendered for the Agent that makes it. An execution's author is
+the AgentDB root ID of its accepted input's pin, not a display name or role
+label. The requesting Agent's own publications and model/tool exchanges replay
+as assistant turns. Another Agent's publication arrives as a user message
+framed `{"kind":"local_message","sender":…,"body":…}`. The sender is the
+display name recorded with the completion. That Agent's native model and tool
+exchanges are omitted. A recorded call that selects them fails validation.
+Display rows use the same recorded sender, so two Agents stay distinct after
+reopen. While another Agent's tool call is pending, building context refuses
+rather than splitting its exchange. The resident chat server runs one turn per
+Session, so this fixture adds no parallel turns.
+
 | Write                                         | What survives, and why                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Session creation, Agent join, explicit update | One exact config reference in the pin Entry. No copy of the Agent config in the transcript.                                                                                                                                                                                                                                                                                                                                                              |
