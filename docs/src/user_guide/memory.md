@@ -120,6 +120,61 @@ Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix us
 
 Refs accept either a display name or an eidetica DB ID.
 
+## Write to a bank from Rust
+
+Use the workspace crate `chaz-memory-store` for a Rust importer that does not run Chaz. It writes the same `memory` table that Chaz reads. It does not look up agents, create banks, attach them, or schedule refreshes.
+
+| API                                          | Purpose                                                                                   |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `memory_table(&transaction)`                 | Open the standard table for typed `MemoryEntry` reads and writes.                         |
+| `apply_batch(&database, &upserts, &deletes)` | Apply explicit row IDs in one transaction. Return inserted, updated, and removed counts.  |
+| `MemoryUpsert`                               | Supply an `id`, a human-readable `key`, a `value`, and `tags`. The caller assigns the ID. |
+
+Use an ordinary standalone bank, preferably dedicated to one source. Bank Write covers the entire bank, not a range of row IDs. The importer decides which source data to include, how to identify it and which of its old rows to delete. Rows outside the batch are left alone. The same key, value and tags preserve a row's timestamp; a batch with no changes does not commit. Serialize refreshes that manage the same IDs. A batch is atomic, but a scan used to decide stale IDs and the later batch are not an atomic compare-and-swap. Logical deletion removes a row from current recall; it does not erase signed history.
+
+### Walkthrough: refresh a dedicated source bank
+
+1. As the operator, create a normal bank with `/memory new reference-notes` (or reuse its existing DB). Record the stable DB ID from `/memory list`. Use `/memory grant reference-notes chaz read` so the consuming Agent can recall but cannot write. If you want auto-recall in this version, also use `/memory attach reference-notes` in the session.
+2. As bank admin, on an already-open admin handle for that ID (`bank` below), authorize a fresh public key on **only** that bank. Store the resulting single-key bundle and its password in separate protected files or use your secret manager. Do not give the importer the Chaz account password, the admin key, or any Agent key. This example uses the bank ID as the bundle locator. The locator names the credential; the ACL is what grants access.
+
+   ```rust,ignore
+   use eidetica::{account::CredentialBundle, auth::{crypto::generate_keypair, types::{AuthKey, Permission}}};
+
+   let (writer, writer_pubkey) = generate_keypair();
+   let bundle = CredentialBundle::seal(bank.root_id(), &[writer], password)?;
+   let tx = bank.new_transaction().await?;
+   tx.get_settings()?.set_auth_key(
+       &writer_pubkey, AuthKey::active(Some("reference-notes writer"), Permission::Write(10)),
+   ).await?;
+   tx.commit().await?;
+   // Store serde_json::to_vec(&bundle)? securely; retain writer_pubkey for revocation.
+   ```
+
+3. Use the `write_bank` example from `crates/memory-store/examples/`, or call the same API from your importer. The example expects the path to a trusted Eidetica Unix service socket, the exact bank ID, the encrypted bundle, and a JSON batch. The password is read verbatim from standard input. The SDK proves possession on its own connection and signs locally; it does not log into Chaz. Use compatible SDK and daemon versions. The Unix socket is a filesystem-trusted service interface, not an isolation boundary for a hostile local process.
+
+   ```json
+   {
+     "upserts": [
+       {
+         "id": "reference:lamp",
+         "key": "Lighthouse lamp",
+         "value": "The spare lens is in cabinet 4.",
+         "tags": ["source:maintenance-notes"]
+       }
+     ],
+     "deletes": []
+   }
+   ```
+
+   ```text
+   $ cargo run -q -p chaz-memory-store --example write_bank -- "$SOCKET" "$BANK_ID" writer.json batch.json < writer-password
+   inserted=1 updated=0 removed=0
+   ```
+
+   `recall` with `bank: "reference-notes"` can now find the lens. Run the same batch again and the receipt is `inserted=0 updated=0 removed=0`. Edit the value using the same ID to update it, or put that ID in `deletes` (not in `upserts`) to remove it. An empty batch does not clear a bank.
+
+4. To stop recall in one session, run `/memory detach reference-notes`. To remove the Agent's actual bank access, run `/memory revoke reference-notes chaz`; detaching alone does not revoke Read. Neither action stops the importer. To stop refreshes, the bank admin revokes `writer_pubkey` with `tx.get_settings()?.revoke_auth_key(&writer_pubkey).await?` and commits. After the service observes revocation, the next fresh refresh fails, for example with `Error: I/O error: [auth::PermissionDenied] Permission denied: … not permitted for Read`. Check the exact ID and grant if the denial was not intended. The importer cannot restore either grant. Revocation does not withdraw text already read or cancel an in-flight operation.
+
 ## Autonomous Memory Auto-recall
 
 When the `memory` extension is active, chaz automatically searches the agent's own memory and the attached banks its key can currently read for facts relevant to the current conversation. The top results are injected at the end of context as a `## Relevant Memories` block — the agent sees them alongside the conversation history, not in its system prompt.

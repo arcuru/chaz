@@ -20,6 +20,7 @@ backoff.workspace = true
 base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+chaz-memory-store = { path = "../memory-store" }
 clap.workspace = true
 cron.workspace = true
 dirs.workspace = true

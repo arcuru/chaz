@@ -96,13 +96,12 @@ fn read_schema_banks() -> Value {
 /// Default cap on returned entries when the caller doesn't specify `limit`.
 const DEFAULT_RECALL_LIMIT: usize = 10;
 
-/// Parse `{query, tags?, limit?}`, search `(db, store)`, return the formatted result.
+/// Parse `{query, tags?, limit?}`, search `db`, return the formatted result.
 /// Shared by `Recall`'s self-memory and bank paths.
 async fn do_recall(
     ctx: &ToolContext,
     arguments: &Value,
     db: &Database,
-    store: &str,
     log_scope: &'static str,
     embedder: Option<&dyn Embedder>,
 ) -> Result<String, String> {
@@ -114,7 +113,7 @@ async fn do_recall(
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_RECALL_LIMIT)
         .max(1);
-    let result = search_memory(db, store, query, &tags_filter, limit, None, embedder).await?;
+    let result = search_memory(db, query, &tags_filter, limit, None, embedder).await?;
     debug!(agent = %ctx.agent_name, %query, scope = log_scope, "Recalled memory");
     Ok(result)
 }
@@ -197,14 +196,7 @@ impl Tool for Remember {
                 timestamp: Utc::now(),
                 tags: string_array_arg(&arguments, "tags"),
             };
-            write_memory_entry(
-                &db,
-                crate::agent_db::MEMORY_STORE,
-                entry,
-                self.embedder.as_deref(),
-                actor,
-            )
-            .await?;
+            write_memory_entry(&db, entry, self.embedder.as_deref(), actor).await?;
             debug!(agent = %ctx.agent_name, %key, ?bank, "Stored memory");
             Ok(format!("{prefix}: {key} = {value}"))
         })
@@ -257,16 +249,9 @@ impl Tool for Recall {
                 None => {
                     let agent_db =
                         open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
-                    do_recall(
-                        ctx,
-                        &arguments,
-                        agent_db.database(),
-                        crate::agent_db::MEMORY_STORE,
-                        "own",
-                        embedder,
-                    )
-                    .await
-                    .map_err(Into::into)
+                    do_recall(ctx, &arguments, agent_db.database(), "own", embedder)
+                        .await
+                        .map_err(Into::into)
                 }
                 Some(bank_name) => {
                     let caller = bank_actor(ctx)?;
@@ -278,15 +263,7 @@ impl Tool for Recall {
                         Permission::Read,
                     )
                     .await?;
-                    let result = do_recall(
-                        ctx,
-                        &arguments,
-                        &bank,
-                        crate::memory_bank_db::MEMORY_STORE,
-                        "bank",
-                        embedder,
-                    )
-                    .await?;
+                    let result = do_recall(ctx, &arguments, &bank, "bank", embedder).await?;
                     SessionRegistry::check_index_grant(&bank, &caller.pubkey, Permission::Read)
                         .await
                         .map_err(|_| bank_unavailable(bank_name))?;
@@ -440,7 +417,6 @@ impl Tool for ListMemoryBanks {
 /// embedding API issue must not lose the user's memory.
 pub(crate) async fn write_memory_entry(
     database: &Database,
-    store_name: &str,
     entry: MemoryEntry,
     embedder: Option<&dyn Embedder>,
     bank_actor: Option<&DbEntry>,
@@ -463,8 +439,7 @@ pub(crate) async fn write_memory_entry(
         .new_transaction()
         .await
         .map_err(|e| format!("Failed to create transaction: {e}"))?;
-    let store = txn
-        .get_store::<Table<MemoryEntry>>(store_name)
+    let store = chaz_memory_store::memory_table(&txn)
         .await
         .map_err(|e| format!("Failed to open memory store: {e}"))?;
     let row_id = store
@@ -522,15 +497,13 @@ pub(crate) struct ScoredMemory {
 /// instead — it skips the format-then-parse round-trip.
 pub(crate) async fn search_memory(
     database: &Database,
-    store_name: &str,
     query: &str,
     tags_filter: &[String],
     limit: usize,
     entry_cap: Option<usize>,
     embedder: Option<&dyn Embedder>,
 ) -> Result<String, String> {
-    let hits =
-        search_memory_scored(database, store_name, query, tags_filter, limit, embedder).await?;
+    let hits = search_memory_scored(database, query, tags_filter, limit, embedder).await?;
     if hits.is_empty() {
         return Ok(no_results_message(query, tags_filter));
     }
@@ -546,13 +519,12 @@ pub(crate) async fn search_memory(
 /// callers compose their own no-results messaging.
 pub(crate) async fn search_memory_structured(
     database: &Database,
-    store_name: &str,
     query: &str,
     tags_filter: &[String],
     limit: usize,
     embedder: Option<&dyn Embedder>,
 ) -> Result<Vec<ScoredMemory>, String> {
-    search_memory_scored(database, store_name, query, tags_filter, limit, embedder).await
+    search_memory_scored(database, query, tags_filter, limit, embedder).await
 }
 
 /// Hybrid lexical + semantic search pipeline. The shared core that
@@ -576,7 +548,6 @@ pub(crate) async fn search_memory_structured(
 ///    surface.
 async fn search_memory_scored(
     database: &Database,
-    store_name: &str,
     query: &str,
     tags_filter: &[String],
     limit: usize,
@@ -600,8 +571,7 @@ async fn search_memory_scored(
         .new_transaction()
         .await
         .map_err(|e| format!("Failed to create transaction: {e}"))?;
-    let store = txn
-        .get_store::<Table<MemoryEntry>>(store_name)
+    let store = chaz_memory_store::memory_table(&txn)
         .await
         .map_err(|e| format!("Failed to open memory store: {e}"))?;
 

@@ -334,9 +334,7 @@ impl ImportSessionMessages {
         let read = source.new_transaction_at(&snapshot).await?;
         let messages = read.get_store::<Table<SessionEntry>>("entries").await?;
         let txn = bank.new_transaction().await?;
-        let table = txn
-            .get_store::<Table<MemoryEntry>>(crate::memory_bank_db::MEMORY_STORE)
-            .await?;
+        let table = chaz_memory_store::memory_table(&txn).await?;
         let mut changed = 0;
         for id in &args.message_ids {
             let row = messages.get(id).await?;
