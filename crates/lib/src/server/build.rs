@@ -655,9 +655,13 @@ pub async fn build(
         tool_registry.register(crate::tools::MatrixRoomInfo {
             registry: registry.clone(),
         });
-        tool_registry.register(crate::tools::MatrixRename {
-            registry: registry.clone(),
-        });
+        use crate::bridge::matrix_workspace::ActionKind;
+        for kind in [ActionKind::Rename, ActionKind::NewChat] {
+            tool_registry.register(crate::tools::MatrixChatAction {
+                registry: registry.clone(),
+                kind,
+            });
+        }
     }
 
     // Set up extension hub infrastructure before install_all.

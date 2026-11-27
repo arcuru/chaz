@@ -3,7 +3,7 @@
 //!
 //! Everything here is management metadata. The Space and Lobby never get a
 //! session or a model turn; each chat's session is created by the explicit
-//! `!chaz chat new` operation, never by generic join bootstrap. Room names and
+//! new-chat operation, never by generic join bootstrap. Room names and
 //! Space edges are labels, not identity: a chat is identified by its recorded
 //! room ID and session ID, and authorization is the exact configured manager
 //! MXID plus the existing allow list.
@@ -25,9 +25,10 @@ mod storage;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use chaz_core::bridge::MatrixRenameProposal;
+use chaz_core::bridge::matrix_workspace::{ActionKind, ActionRequest};
+use chaz_core::session::TurnRequestId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -61,7 +62,6 @@ const CHAT_STEPS: [&str; 7] = [
     "invite",
 ];
 const RENAME_STEPS: [&str; 2] = ["matrix.name", "session.label"];
-const RENAME_CONFIRM_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -180,12 +180,6 @@ pub(crate) trait SessionOps: Send + Sync + 'static {
         session: &str,
         label: &str,
     ) -> impl Future<Output = anyhow::Result<bool>> + Send;
-    fn rename_proposal(
-        &self,
-        room: &str,
-        session: &str,
-        proposal: &str,
-    ) -> impl Future<Output = anyhow::Result<MatrixRenameProposal>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,18 +428,22 @@ pub(crate) struct Workspace<M, S> {
     owning_agent: String,
     manager: Option<String>,
     index: RoomIndex,
-    // One recent, unconsumed manager-origin turn per chat, in this bridge
-    // generation only. A synchronized row's claimed sender is not authority.
-    rename_requests: std::sync::Mutex<HashMap<String, RenameRequest>>,
     /// Serializes every operation and holds the authoritative cached copy:
     /// the peer-local record is written only through this lock.
     state: Mutex<Option<WorkspaceState>>,
 }
 
-struct RenameRequest {
-    session: String,
-    request: String,
-    expires: Instant,
+/// Created only by Matrix ingress after committing a live, waking message.
+/// Never reconstructed from a synchronized row, even when its sender matches.
+pub(super) struct ChatWake {
+    pub(super) sender: String,
+    pub(super) room: String,
+    pub(super) session: String,
+    pub(super) event: String,
+    pub(super) event_at: u64,
+    pub(super) turn: TurnRequestId,
+    pub(super) expires: Instant,
+    pub(super) addressed: bool,
 }
 
 fn new_workspace_id() -> anyhow::Result<String> {
@@ -476,7 +474,7 @@ const HELP: &str = "**workspace commands** (prefix with `!chaz `):\n\
 \n\
 In a direct chat with the bot: `workspace setup` · `workspace confirm <op>`\n\
 In the Lobby: `chat new <name>` · `chat list` · `chat rename <chat> <name>`\n\
-In a workspace chat: `chat rename <name>` · `chat confirm-rename <proposal> <exact title>`\n\
+In a workspace chat: `chat rename <name>` or ask the agent to rename it or open a private chat\n\
 Anywhere above: `workspace status [<op>]` · `workspace retry <op>` · `workspace cancel <op>`\n\
 \n\
 The Lobby is command-only; talk to the agent in a chat room.";
@@ -511,7 +509,6 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             owning_agent,
             manager,
             index,
-            rename_requests: Default::default(),
             state: Mutex::new(state),
         })
     }
@@ -520,46 +517,93 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
         self.index.clone()
     }
 
-    /// Called only after committing a live, waking Matrix message. Do not
-    /// reconstruct these authorizations from history, including after restart.
-    pub(crate) fn remember_rename_request(
+    async fn act(
         &self,
-        sender: &str,
-        room: &str,
-        session: &str,
-        request: &str,
-    ) {
-        if self.manager.as_deref() != Some(sender)
-            || !matches!(self.index.get(room), Some(Place::Chat { ready: true, session_db_id: Some(id), .. }) if id == session)
-        {
-            return;
-        }
-        self.rename_requests.lock().unwrap().insert(
-            room.to_owned(),
-            RenameRequest {
-                session: session.to_owned(),
-                request: request.to_owned(),
-                expires: Instant::now() + RENAME_CONFIRM_WINDOW,
-            },
+        wake: &ChatWake,
+        request: &ActionRequest,
+        check_live: impl Future<Output = anyhow::Result<()>> + Send,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            self.manager.as_deref() == Some(&wake.sender),
+            "workspace actions require the configured Matrix manager"
         );
+        anyhow::ensure!(
+            wake.addressed
+                && request.login == self.login_id
+                && request.room == wake.room
+                && request.event == wake.event
+                && request.turn == wake.turn,
+            "workspace actions require an addressed, live turn in this chat"
+        );
+        let label = valid_label(&request.title)?;
+        let mut guard = self.state.lock().await;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
+        self.check_identity(state, &wake.sender)?;
+        let handle = state
+            .chats
+            .iter()
+            .find(|chat| {
+                chat.ready
+                    && chat.room_id == wake.room
+                    && chat.session_db_id.as_deref() == Some(&wake.session)
+            })
+            .map(|chat| chat.handle.clone())
+            .ok_or_else(|| anyhow::anyhow!("workspace chat binding changed"))?;
+        // Check under the operation lock, not merely when the row arrived. The
+        // live adapter reopens the exact binding and verifies this attempt.
+        check_live.await?;
+        anyhow::ensure!(
+            Instant::now() < wake.expires,
+            "this workspace turn is no longer live"
+        );
+        if let Some(op) = state.operations.iter().find(|op| op.event_id == wake.event) {
+            let same_action = match (&op.kind, request.kind) {
+                (
+                    OpKind::NewChat {
+                        label: previous, ..
+                    },
+                    ActionKind::NewChat,
+                ) => previous == &label,
+                (
+                    OpKind::Rename {
+                        handle: target,
+                        label: previous,
+                    },
+                    ActionKind::Rename,
+                ) => target == &handle && previous == &label,
+                _ => false,
+            };
+            anyhow::ensure!(
+                same_action && op.origin_room == wake.room && op.requester == wake.sender,
+                "this Matrix message already requested a different workspace action"
+            );
+            // Return the existing result, even if incomplete. Only explicit
+            // human retry may reconcile an operation that may have run.
+            return Ok(describe(state, op));
+        }
+        self.ensure_idle(state)?;
+        let kind = match request.kind {
+            ActionKind::Rename => OpKind::Rename { handle, label },
+            ActionKind::NewChat => self.allocate_chat(state, label),
+        };
+        self.start_chat_operation(state, kind, &wake.sender, &wake.event, &wake.room)
+            .await
     }
 
-    fn consume_rename_request(
-        &self,
-        room: &str,
-        session: &str,
-        request: &str,
-    ) -> anyhow::Result<()> {
-        let mut requests = self.rename_requests.lock().unwrap();
+    fn check_identity(&self, state: &WorkspaceState, manager: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
-            requests
-                .get(room)
-                .is_some_and(|current| current.session == session
-                    && current.request == request
-                    && Instant::now() < current.expires),
-            "no current unconfirmed manager request in this chat; ask again here"
+            state.login_id == self.login_id
+                && state.owning_agent == self.owning_agent
+                && state.manager == manager
+                && state.bot_mxid == self.matrix.bot_id()?
+                && state.agent_db_id == self.sessions.agent_id()?,
+            "the workspace record belongs to login {} / agent {} / manager {}, not this configuration; refusing",
+            state.login_id,
+            state.owning_agent,
+            state.manager
         );
-        requests.remove(room);
         Ok(())
     }
 
@@ -597,18 +641,7 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
         );
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.as_ref() {
-            anyhow::ensure!(
-                state.login_id == self.login_id
-                    && state.owning_agent == self.owning_agent
-                    && state.manager == manager
-                    && state.bot_mxid == self.matrix.bot_id()?
-                    && state.agent_db_id == self.sessions.agent_id()?,
-                "the workspace record belongs to login {} / agent {} / manager {}, \
-                 not this configuration; refusing",
-                state.login_id,
-                state.owning_agent,
-                state.manager
-            );
+            self.check_identity(state, manager)?;
             // Repeated delivery of one event returns the same receipt.
             if let Some(op) = state.operations.iter().find(|o| o.event_id == req.event_id) {
                 return Ok(describe(state, op));
@@ -693,25 +726,9 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
                 self.ensure_idle(state)?;
-                state.next_chat += 1;
-                let handle = format!("c{}", state.next_chat);
-                let id = state.alloc_op();
-                let mut steps = BTreeMap::new();
-                for step in CHAT_STEPS {
-                    steps.insert(step.to_string(), Step::Pending);
-                }
-                state.operations.push(Operation {
-                    id: id.clone(),
-                    kind: OpKind::NewChat { handle, label },
-                    requester: req.sender.to_string(),
-                    event_id: req.event_id.to_string(),
-                    origin_room: req.room_id.to_string(),
-                    status: OpStatus::Incomplete,
-                    steps,
-                    last_error: None,
-                });
-                self.save(state).await?;
-                self.drive(state, &id).await
+                let kind = self.allocate_chat(state, label);
+                self.start_chat_operation(state, kind, req.sender, req.event_id, req.room_id)
+                    .await
             }
             (Some("chat"), Some("list")) => {
                 anyhow::ensure!(
@@ -738,42 +755,6 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                     .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
                 self.rename(state, req, handle, label).await
             }
-            (Some("chat"), Some("confirm-rename")) => {
-                let Origin::Managed(Place::Chat {
-                    handle,
-                    ready: true,
-                    ..
-                }) = origin
-                else {
-                    anyhow::bail!("confirm a proposed title inside its workspace chat");
-                };
-                let token = words.get(2).ok_or_else(|| {
-                    anyhow::anyhow!("usage: !chaz chat confirm-rename <proposal> <exact title>")
-                })?;
-                let title = valid_label(&rest(3))?;
-                let state = guard
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
-                let chat = state
-                    .chat(handle)
-                    .filter(|chat| chat.ready && chat.room_id == req.room_id)
-                    .ok_or_else(|| anyhow::anyhow!("workspace chat identity changed; refusing"))?;
-                let session = chat
-                    .session_db_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("workspace chat has no session"))?;
-                self.ensure_idle(state)?;
-                let proposal = self
-                    .sessions
-                    .rename_proposal(req.room_id, session, token)
-                    .await?;
-                anyhow::ensure!(
-                    proposal.title == title,
-                    "the title does not match the proposal; nothing was renamed"
-                );
-                self.consume_rename_request(req.room_id, session, &proposal.request_id)?;
-                self.rename(state, req, handle.clone(), title).await
-            }
             _ => anyhow::bail!("unknown workspace command; see !chaz workspace help"),
         }
     }
@@ -793,17 +774,48 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             "chat {handle} is not ready; finish its creation first"
         );
         self.ensure_idle(state)?;
+        self.start_chat_operation(
+            state,
+            OpKind::Rename { handle, label },
+            req.sender,
+            req.event_id,
+            req.room_id,
+        )
+        .await
+    }
+
+    fn allocate_chat(&self, state: &mut WorkspaceState, label: String) -> OpKind {
+        state.next_chat += 1;
+        OpKind::NewChat {
+            handle: format!("c{}", state.next_chat),
+            label,
+        }
+    }
+
+    async fn start_chat_operation(
+        &self,
+        state: &mut WorkspaceState,
+        kind: OpKind,
+        requester: &str,
+        event_id: &str,
+        room: &str,
+    ) -> anyhow::Result<String> {
         let id = state.alloc_op();
+        let names = match &kind {
+            OpKind::Rename { .. } => RENAME_STEPS.as_slice(),
+            OpKind::NewChat { .. } => CHAT_STEPS.as_slice(),
+            OpKind::Setup => unreachable!("setup is not a chat operation"),
+        };
         state.operations.push(Operation {
             id: id.clone(),
-            kind: OpKind::Rename { handle, label },
-            requester: req.sender.to_string(),
-            event_id: req.event_id.to_string(),
-            origin_room: req.room_id.to_string(),
+            kind,
+            requester: requester.to_owned(),
+            event_id: event_id.to_owned(),
+            origin_room: room.to_owned(),
             status: OpStatus::Incomplete,
-            steps: RENAME_STEPS
-                .into_iter()
-                .map(|s| (s.to_owned(), Step::Pending))
+            steps: names
+                .iter()
+                .map(|&name| (name.to_owned(), Step::Pending))
                 .collect(),
             last_error: None,
         });

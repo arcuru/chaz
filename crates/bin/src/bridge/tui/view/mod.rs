@@ -1535,7 +1535,11 @@ fn build_transcript(
                 }; // future role is inert
                 if matches!(
                     role,
-                    BridgeEventRole::Receipt | BridgeEventRole::MatrixRenameProposal
+                    BridgeEventRole::Receipt
+                        | BridgeEventRole::MatrixRenameProposal
+                        | BridgeEventRole::MatrixNewChatProposal
+                        | BridgeEventRole::MatrixWorkspaceRequest
+                        | BridgeEventRole::MatrixWorkspaceResult
                 ) {
                     continue;
                 }

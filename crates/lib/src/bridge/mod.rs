@@ -30,24 +30,7 @@ pub mod outbound;
 /// Shared startup for standalone bridge executables.
 pub mod process;
 
-/// An inert proposal in the session DB, not evidence of permission to edit
-/// Matrix state. Only the Matrix bridge may match it to live ingress and a
-/// separate, exact-title confirmation.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MatrixRenameProposal {
-    pub request_id: String,
-    pub title: String,
-}
-
-impl MatrixRenameProposal {
-    pub fn from_entry(entry: &SessionEntry) -> Option<Self> {
-        let event = entry.bridge_event()?;
-        (event.role()? == crate::session::BridgeEventRole::MatrixRenameProposal)
-            .then(|| serde_json::from_str(&event.body).ok())
-            .flatten()
-    }
-}
+pub mod matrix_workspace;
 
 /// Trait for transport bridges (Matrix, TUI, etc.)
 ///

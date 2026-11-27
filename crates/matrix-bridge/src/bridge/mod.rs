@@ -42,7 +42,7 @@ use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
 use matrix_sdk::ruma::{OwnedEventId, OwnedTransactionId};
-use matrix_sdk::{Room, RoomState};
+use matrix_sdk::{Room, RoomState, deserialized_responses::EncryptionInfo};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1089,6 +1089,10 @@ impl Bridge for MatrixBridge {
             });
         }
 
+        // Events from before this bridge primed its sync token cannot grant
+        // live workspace authority, even if a later sync delivers them.
+        let actions_since = chrono::Utc::now().timestamp_millis();
+
         // === Unified message handler ===
         //
         // One handler replaces headjack's ~20 per-command registrations plus the
@@ -1122,7 +1126,7 @@ impl Bridge for MatrixBridge {
             let workspace_rooms = workspace_rooms.clone();
 
             mc.client().add_event_handler(
-                move |event: OriginalSyncRoomMessageEvent, room: Room| {
+                move |event: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
                     let server = server.clone();
                     let config = config.clone();
                     let secrets = secrets.clone();
@@ -1528,8 +1532,27 @@ impl Bridge for MatrixBridge {
                                 room_info::observe(&room, managed_chat).await;
                         }
                         match session.add_bridge_input(entry, wake).await {
-                            Ok(request) if managed_chat && session.entries().last().is_some_and(|entry| entry.entry_type == chaz_core::session::EntryType::Message) => {
-                                workspace.remember_rename_request(event.sender.as_str(), &room_id, &session_db_id, request.as_str());
+                            Ok(turn) if managed_chat && session.entries().last().is_some_and(|entry| entry.entry_type == chaz_core::session::EntryType::Message) => {
+                                let event_at = u64::from(event.origin_server_ts.0);
+                                let now = chrono::Utc::now().timestamp_millis();
+                                // Workspace chats are encrypted. Use the SDK's existing
+                                // cross-signed decryption policy; neither plaintext nor
+                                // forwarded invite history may grant action authority.
+                                if workspace::live::fresh_action_event(event_at, actions_since, now)
+                                    && encryption.is_some_and(|info| info.sender == event.sender && info.forwarder.is_none())
+                                    && !matches!(event.content.relates_to, Some(matrix_sdk::ruma::events::room::message::Relation::Replacement(_)))
+                                {
+                                    workspace.watch_actions(room, session.database().clone(), workspace::ChatWake {
+                                        sender: event.sender.to_string(),
+                                        room: room_id,
+                                        session: session_db_id,
+                                        event: event.event_id.to_string(),
+                                        event_at,
+                                        turn,
+                                        expires: std::time::Instant::now() + workspace::live::ACTION_TURN_LIFETIME,
+                                        addressed: is_direct || mentions_bot,
+                                    });
+                                }
                             }
                             Ok(_) => {}
                             Err(e) => error!("Failed to record inbound message: {e}"),

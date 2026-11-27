@@ -144,7 +144,6 @@ struct Registry {
     by_source: HashMap<String, String>,
     bindings: HashMap<String, String>,
     labels: HashMap<String, String>,
-    proposals: HashMap<(String, String), (String, String)>,
     delivery: HashSet<(String, String)>,
     creates: usize,
     fail_once: HashSet<&'static str>,
@@ -224,23 +223,6 @@ impl SessionOps for FakeSessions {
             .labels
             .insert(session.into(), label.into());
         Ok(previous.as_deref() != Some(label))
-    }
-    async fn rename_proposal(
-        &self,
-        room: &str,
-        session: &str,
-        proposal: &str,
-    ) -> anyhow::Result<MatrixRenameProposal> {
-        self.check_binding(room, session).await?;
-        let registry = self.0.lock().unwrap();
-        let (request_id, title) = registry
-            .proposals
-            .get(&(session.into(), proposal.into()))
-            .ok_or_else(|| anyhow::anyhow!("no matching rename proposal in this chat"))?;
-        Ok(MatrixRenameProposal {
-            request_id: request_id.clone(),
-            title: title.clone(),
-        })
     }
 }
 
@@ -632,6 +614,122 @@ async fn repeated_and_concurrent_delivery_of_one_request_creates_one_chat() {
     assert_eq!(h.posts(), 3);
 }
 
+fn wake_and_request(chat: &Chat, kind: ActionKind, title: &str) -> (ChatWake, ActionRequest) {
+    let wake = ChatWake {
+        sender: MANAGER.into(),
+        room: chat.room_id.clone(),
+        session: chat.session_db_id.clone().unwrap(),
+        event: "$waking-event".into(),
+        event_at: 1,
+        turn: TurnRequestId::parse("original-turn"),
+        expires: Instant::now() + std::time::Duration::from_secs(60),
+        addressed: true,
+    };
+    let request = ActionRequest {
+        kind,
+        title: title.into(),
+        turn: wake.turn.clone(),
+        attempt: "first-attempt".into(),
+        login: LOGIN.into(),
+        room: wake.room.clone(),
+        event: wake.event.clone(),
+    };
+    (wake, request)
+}
+
+#[tokio::test]
+async fn one_live_manager_event_admits_at_most_one_recoverable_chat() {
+    let h = harness("12").await;
+    h.setup().await;
+    h.lobby("chat new First").await;
+    let before = h.state().await;
+    let first = &before.chats[0];
+    let (mut wake, mut request) = wake_and_request(first, ActionKind::NewChat, "New  chat");
+    wake.sender = "@guest:example.org".into();
+    assert!(h.ws.act(&wake, &request, async { Ok(()) }).await.is_err());
+    wake.sender = MANAGER.into();
+    wake.addressed = false;
+    assert!(h.ws.act(&wake, &request, async { Ok(()) }).await.is_err());
+    wake.addressed = true;
+    request.turn = TurnRequestId::parse("other-turn");
+    assert!(h.ws.act(&wake, &request, async { Ok(()) }).await.is_err());
+    request.turn = wake.turn.clone();
+    request.room = "!other:example.org".into();
+    assert!(h.ws.act(&wake, &request, async { Ok(()) }).await.is_err());
+    request.room = wake.room.clone();
+    request.login = "@wrong:example.org".into();
+    assert!(h.ws.act(&wake, &request, async { Ok(()) }).await.is_err());
+    request.login = LOGIN.into();
+    request.event = "$other-event".into();
+    assert!(h.ws.act(&wake, &request, async { Ok(()) }).await.is_err());
+    request.event = wake.event.clone();
+    assert!(
+        h.ws.act(&wake, &request, async {
+            anyhow::bail!("binding disappeared")
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(h.state().await, before);
+    assert_eq!(h.posts(), 3);
+
+    h.hs.0
+        .lock()
+        .unwrap()
+        .script
+        .push_back(Create::LostResponse);
+    let invoke = || {
+        h.ws.act(
+            &wake,
+            &request,
+            h.reg.check_binding(&wake.room, &wake.session),
+        )
+    };
+    let (first_call, duplicate) = tokio::join!(invoke(), invoke());
+    let reply = first_call.unwrap();
+    assert!(
+        reply.contains("uncertain") && !reply.contains("Open chat:"),
+        "{reply}"
+    );
+    assert_eq!(duplicate.unwrap(), reply);
+    h.reg.0.lock().unwrap().fail_once.insert("provision");
+    let reply = h.lobby("workspace retry op-3").await;
+    assert!(
+        reply.contains("incomplete") && !reply.contains("Open chat:"),
+        "{reply}"
+    );
+    let ready = h.lobby("workspace retry op-3").await;
+    let state = h.state().await;
+    assert_eq!(state.chats.len(), 2);
+    assert_eq!(&state.chats[0], first);
+    let new = &state.chats[1];
+    assert_ne!(new.session_db_id, first.session_db_id);
+    assert!(
+        new.ready && ready.contains(&format!("Open chat: {}", link(&new.room_id))),
+        "{ready}"
+    );
+    assert_eq!(invoke().await.unwrap(), ready);
+    request.title = "Different chat".into();
+    assert!(
+        h.ws.act(&wake, &request, async { Ok(()) })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already requested")
+    );
+    assert_eq!(h.state().await, state);
+    assert_eq!(h.posts(), 4, "only one POST for the waking event");
+    assert_eq!(h.reg.0.lock().unwrap().creates, 2);
+    let hs = h.hs.0.lock().unwrap();
+    assert_eq!(
+        hs.invites
+            .iter()
+            .filter(|(id, _)| id == &new.room_id)
+            .collect::<Vec<_>>(),
+        vec![&(new.room_id.clone(), MANAGER.into())]
+    );
+}
+
 #[tokio::test]
 async fn a_lost_create_response_is_reconciled_never_reposted() {
     use eidetica::service::ServiceServer;
@@ -1019,76 +1117,47 @@ async fn lost_rename_response_cannot_abandon_inconsistent_labels() {
 }
 
 #[tokio::test]
-async fn confirmed_rename_requires_the_manager_exact_title_and_live_request_once() {
+async fn manager_turn_rename_preserves_identity_and_legacy_confirmation_is_inert() {
     let h = harness("12").await;
     h.setup().await;
     h.lobby("chat new Bike repair").await;
-    h.lobby("chat new Sibling").await;
     let before = h.state().await;
     let chat = &before.chats[0];
-    let sibling = &before.chats[1];
     let sid = chat.session_db_id.as_deref().unwrap();
-    h.reg.0.lock().unwrap().proposals.insert(
-        (sid.into(), "proposal".into()),
-        ("turn".into(), "Winter bike".into()),
-    );
-    let confirm = async |sender, room, command| {
-        h.ws.handle(Request {
-            sender,
-            event_id: &h.next_event(),
-            room_id: room,
-            origin: Origin::Managed(h.ws.index().get(room).unwrap()),
-            command,
-        })
-        .await
-        .unwrap()
-    };
-    let command = "chat confirm-rename proposal Winter bike";
-    let outsider = "@guest:example.org";
-    h.ws.remember_rename_request(outsider, &chat.room_id, sid, "turn");
-    assert!(
-        confirm(MANAGER, &chat.room_id, command)
+    let (wake, request) = wake_and_request(chat, ActionKind::Rename, "Winter bike");
+    for command in [
+        "chat confirm-rename proposal Winter bike",
+        "chat confirm-new proposal Old chat",
+    ] {
+        let reply =
+            h.ws.handle(Request {
+                sender: MANAGER,
+                event_id: &h.next_event(),
+                room_id: &chat.room_id,
+                origin: Origin::Managed(h.ws.index().get(&chat.room_id).unwrap()),
+                command,
+            })
             .await
-            .contains("no current unconfirmed manager request")
-    );
-    h.ws.remember_rename_request(MANAGER, &chat.room_id, sid, "different-turn");
-    assert!(
-        confirm(MANAGER, &chat.room_id, command)
-            .await
-            .contains("no current unconfirmed manager request")
-    );
-    h.ws.remember_rename_request(MANAGER, &chat.room_id, sid, "turn");
-    assert!(
-        confirm(outsider, &chat.room_id, command)
-            .await
-            .contains("limited to the configured manager")
-    );
-    assert!(
-        confirm(MANAGER, &sibling.room_id, command)
-            .await
-            .contains("no matching rename proposal")
-    );
-    assert!(
-        confirm(
-            MANAGER,
-            &chat.room_id,
-            "chat confirm-rename proposal Different title"
-        )
-        .await
-        .contains("does not match")
-    );
+            .unwrap();
+        assert!(reply.contains("unknown workspace command"), "{reply}");
+    }
     assert_eq!(h.state().await, before);
-
+    let invoke = || {
+        h.ws.act(
+            &wake,
+            &request,
+            h.reg.check_binding(&wake.room, &wake.session),
+        )
+    };
     h.hs.0.lock().unwrap().fail_once.insert("name_power");
-    let denied = confirm(MANAGER, &chat.room_id, command).await;
+    let denied = invoke().await.unwrap();
     assert!(denied.contains("injected name_power failure"), "{denied}");
     assert!(!h.hs.0.lock().unwrap().names.contains_key(&chat.room_id));
     assert_eq!(h.reg.0.lock().unwrap().labels[sid], "Bike repair");
     assert_eq!(h.state().await.chats, before.chats);
+    assert_eq!(invoke().await.unwrap(), denied, "no automatic retry");
 
-    // Retry a confirmed operation, not the proposal. Only its literal title
-    // can be applied; replay must not create another operation.
-    let reply = h.lobby("workspace retry op-4").await;
+    let reply = h.lobby("workspace retry op-3").await;
     assert!(
         reply.contains("room name changed, session label changed"),
         "{reply}"
@@ -1098,11 +1167,7 @@ async fn confirmed_rename_requires_the_manager_exact_title_and_live_request_once
     assert_eq!(after.chats[0].session_db_id.as_deref(), Some(sid));
     assert_eq!(h.hs.0.lock().unwrap().names[&chat.room_id], "Winter bike");
     assert_eq!(h.reg.0.lock().unwrap().labels[sid], "Winter bike");
-    assert!(
-        confirm(MANAGER, &chat.room_id, command)
-            .await
-            .contains("no current unconfirmed manager request")
-    );
+    assert_eq!(invoke().await.unwrap(), reply);
     assert_eq!(h.state().await, after);
 }
 
