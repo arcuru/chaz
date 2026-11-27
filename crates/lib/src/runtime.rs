@@ -55,6 +55,28 @@ pub trait RuntimeRecorder: Send + Sync {
         Ok(())
     }
 
+    /// Optional replacement for the derived baseline at each logical request.
+    /// A recorder providing it also owns the observed history cut.
+    fn fresh_call_context<'a>(
+        &'a self,
+        _messages: &'a [RuntimeMessage],
+        _sources: &'a [ContextSource],
+    ) -> Pin<Box<dyn Future<Output = Result<Option<CallContext>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Establish the tool execution's observation cut before invoking the
+    /// tool. Existing recorders keep their independent effect safeguards.
+    fn begin_tool_execution<'a>(
+        &'a self,
+        _model_sequence: u64,
+        _call_index: usize,
+        _name: &'a str,
+        _args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Recorded Worker provenance when this invocation has no queued turn
     /// request. This is not a request, checkpoint or Agent-job identity.
     fn standalone_worker_invocation(&self) -> Option<&str> {
@@ -137,6 +159,11 @@ pub trait RuntimeRecorder: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+pub struct CallContext {
+    pub messages: Vec<RuntimeMessage>,
+    pub sources: Vec<ContextSource>,
 }
 
 pub struct CallPreparation<'a> {
@@ -1191,8 +1218,17 @@ impl<'a> RoundProjector<'a> {
         max_retries: u32,
         recorder: &Option<Arc<dyn RuntimeRecorder>>,
     ) -> Result<Result<LLMResponse, LlmError>, String> {
-        let baseline = messages;
         let sources = self.sources_for(messages.len());
+        let refreshed = if let Some(recorder) = recorder {
+            recorder.fresh_call_context(messages, &sources).await?
+        } else {
+            None
+        };
+        let (messages, sources) = match &refreshed {
+            Some(fresh) => (fresh.messages.as_slice(), fresh.sources.clone()),
+            None => (messages, sources),
+        };
+        let baseline = messages;
         if let Some(compactor) = &mut self.compactor {
             compactor.refresh(messages, &sources, tools).await?;
         }
@@ -1238,7 +1274,9 @@ impl<'a> RoundProjector<'a> {
             } else {
                 Some(view_sources)
             };
-            if projected.is_none() && compacted.as_ref().is_some_and(|v| v.compacted) {
+            if projected.is_none()
+                && (refreshed.is_some() || compacted.as_ref().is_some_and(|v| v.compacted))
+            {
                 projected = Some(ProjectedRequest {
                     cache: view_cache,
                     messages: view_messages.to_vec(),
@@ -2485,6 +2523,11 @@ async fn invoke_tool(
     let execution = async {
         // A lost reply can follow a completed effect. Invoke once; an error
         // classification is not permission to resubmit the call.
+        if let Some((recorder, model_sequence, call_index)) = checkpoint {
+            recorder
+                .begin_tool_execution(model_sequence, call_index, name, &args)
+                .await?;
+        }
         call_ctx.call_timeout = timeout;
         call_ctx.call_deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
         // Shell enforces the exact execution ceiling in its host. Give only

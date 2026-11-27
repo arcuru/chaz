@@ -8,8 +8,13 @@ use eidetica::{Database, Transaction};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value as Json};
 
-const KEY: &str = "value";
+pub(crate) const KEY: &str = "value";
 const VERSION: i64 = 1;
+
+/// A native record whose envelope this reader does not understand.
+#[derive(Debug, thiserror::Error)]
+#[error("missing or unsupported record version")]
+pub(crate) struct UnsupportedVersion;
 
 fn encode(value: Json) -> anyhow::Result<Value> {
     Ok(match value {
@@ -80,45 +85,96 @@ pub(crate) async fn read<T: DeserializeOwned + Default>(
     read_in(&txn, store_name).await
 }
 
+/// One complete stored record, before its fields are read as any Rust type.
+pub(crate) enum Stored {
+    Text(String),
+    Native(Map<String, Json>),
+}
+
+impl Stored {
+    pub(crate) async fn read_in(
+        txn: &Transaction,
+        store_name: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        let store = txn.get_store::<DocStore>(store_name).await?;
+        match store.get(KEY).await {
+            Ok(Value::Text(json)) => Ok(Some(Self::Text(json))),
+            Ok(Value::Doc(record)) => {
+                let decode_record = || -> anyhow::Result<Self> {
+                    ensure!(record.is_atomic(), "record is not atomic");
+                    ensure!(
+                        record.get("version") == Some(&Value::Int(VERSION)),
+                        UnsupportedVersion
+                    );
+                    ensure!(record.len() == 2, "invalid record envelope");
+                    let fields = record
+                        .get("fields")
+                        .and_then(Value::as_doc)
+                        .context("expected a document of record fields")?;
+                    Ok(Self::Native(decode_fields(fields)?))
+                };
+                decode_record()
+                    .map(Some)
+                    .with_context(|| invalid_native(store_name))
+            }
+            Ok(other) => Err(eidetica::Error::from(StoreError::TypeMismatch {
+                store: store_name.to_owned(),
+                expected: "atomic Doc or legacy JSON Text".into(),
+                actual: other.type_name().into(),
+            })
+            .into()),
+            // A missing entry, broken history, or auth failure is not a missing key.
+            Err(eidetica::Error::Store(error))
+                if matches!(error.as_ref(), StoreError::KeyNotFound { store, key }
+                    if store == store_name && key == KEY) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn decode<T: DeserializeOwned>(self, store_name: &str) -> anyhow::Result<T> {
+        match self {
+            Self::Text(json) => Ok(serde_json::from_str(&json)?),
+            Self::Native(fields) => serde_json::from_value(Json::Object(fields))
+                .with_context(|| invalid_native(store_name)),
+        }
+    }
+
+    /// Identity of the stored logical record, including fields this reader
+    /// does not know. `Doc` bytes are unsuitable: map order and list position
+    /// IDs differ between equal writes. Changing this envelope needs a new
+    /// `RecordRef` format.
+    pub(crate) fn digest(&self) -> anyhow::Result<String> {
+        let (kind, record) = match self {
+            Self::Text(json) => ("text", json.as_str().into()),
+            Self::Native(fields) => (
+                "native",
+                serde_json::json!({"version": VERSION, "fields": fields}),
+            ),
+        };
+        let envelope = crate::session::canonical_json(serde_json::json!({
+            "encoding": "chaz-agent-record",
+            "version": 1,
+            "kind": kind,
+            "record": record,
+        }))?;
+        Ok(blake3::hash(envelope.as_bytes()).to_hex().to_string())
+    }
+}
+
+fn invalid_native(store_name: &str) -> String {
+    format!("invalid native {store_name} record")
+}
+
 pub(crate) async fn read_in<T: DeserializeOwned + Default>(
     txn: &Transaction,
     store_name: &str,
 ) -> anyhow::Result<T> {
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    match store.get(KEY).await {
-        Ok(Value::Text(json)) => Ok(serde_json::from_str(&json)?),
-        Ok(Value::Doc(record)) => {
-            let decode_record = || -> anyhow::Result<T> {
-                ensure!(record.is_atomic(), "record is not atomic");
-                ensure!(
-                    record.get("version") == Some(&Value::Int(VERSION)),
-                    "missing or unsupported record version"
-                );
-                ensure!(record.len() == 2, "invalid record envelope");
-                let fields = record
-                    .get("fields")
-                    .and_then(Value::as_doc)
-                    .context("expected a document of record fields")?;
-                Ok(serde_json::from_value(Json::Object(decode_fields(
-                    fields,
-                )?))?)
-            };
-            decode_record().with_context(|| format!("invalid native {store_name} record"))
-        }
-        Ok(other) => Err(eidetica::Error::from(StoreError::TypeMismatch {
-            store: store_name.to_owned(),
-            expected: "atomic Doc or legacy JSON Text".into(),
-            actual: other.type_name().into(),
-        })
-        .into()),
-        // A missing entry, broken history, or auth failure is not a missing key.
-        Err(eidetica::Error::Store(error))
-            if matches!(error.as_ref(), StoreError::KeyNotFound { store, key }
-                if store == store_name && key == KEY) =>
-        {
-            Ok(T::default())
-        }
-        Err(error) => Err(error.into()),
+    match Stored::read_in(txn, store_name).await? {
+        Some(record) => record.decode(store_name),
+        None => Ok(T::default()),
     }
 }
 
@@ -224,5 +280,69 @@ mod tests {
             };
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    async fn stored(db: &Database) -> Stored {
+        let txn = db.new_transaction().await.unwrap();
+        Stored::read_in(&txn, CONFIG_STORE).await.unwrap().unwrap()
+    }
+
+    async fn write_native(db: &Database, fields: &Json) -> (String, String) {
+        write(db, CONFIG_STORE, fields).await.unwrap();
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(CONFIG_STORE).await.unwrap();
+        let raw = serde_json::to_string(&store.get(KEY).await.unwrap()).unwrap();
+        (stored(db).await.digest().unwrap(), raw)
+    }
+
+    #[tokio::test]
+    async fn digest_identifies_the_stored_logical_record() {
+        let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+        let fields = serde_json::json!({
+            "system_prompt": "p",
+            "tools": ["b", "a"],
+            "max_context_tokens": u64::MAX,
+            "presets": {"": {}, "a.b": {}, "~": {"model": null}},
+            "not_known_to_this_reader": {"nested": [1, true, {}]},
+        });
+        // Golden: a change here needs a new reference format.
+        let (golden, first) = write_native(&db, &fields).await;
+        assert_eq!(
+            golden,
+            "25c9754c974a3c489df8cbebe420381e05a6767b5ef91db48dd35ed22ad88ac9"
+        );
+        let (again, second) = write_native(&db, &fields).await;
+        assert_eq!(again, golden);
+        assert_ne!(first, second, "stored Doc bytes are not canonical");
+
+        for (pointer, value) in [
+            ("/not_known_to_this_reader/nested/0", serde_json::json!(2)),
+            ("/not_known_to_this_reader", serde_json::json!(null)),
+            ("/max_context_tokens", serde_json::json!(i64::MAX)),
+            ("/max_context_tokens", u64::MAX.to_string().into()),
+            ("/tools", serde_json::json!(["a", "b"])),
+            ("/presets/~0", serde_json::json!({})),
+        ] {
+            let mut changed = fields.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert_ne!(write_native(&db, &changed).await.0, golden, "{pointer}");
+        }
+
+        // Equal logical fields as legacy Text are a different record, and
+        // Text is identified byte for byte.
+        let text = crate::session::canonical_json(fields).unwrap();
+        let mut digests = std::collections::BTreeSet::from([golden]);
+        for text in [text.clone(), format!("{text}\n")] {
+            let txn = db.new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(CONFIG_STORE).await.unwrap();
+            store.set_string(KEY, text).await.unwrap();
+            txn.commit().await.unwrap();
+            digests.insert(stored(&db).await.digest().unwrap());
+        }
+        assert_eq!(digests.len(), 3);
+        assert_eq!(
+            Stored::Text("{}".into()).digest().unwrap(),
+            "25dda33b9c7d92c03555270472c796d034147833e52eeb616646226298ea14b9"
+        );
     }
 }

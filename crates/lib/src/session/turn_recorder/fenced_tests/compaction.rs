@@ -233,7 +233,7 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
     let seed = Box::pin(fx.run()).await.unwrap();
     Box::pin(fx.complete(&seed.body)).await.unwrap();
     let registry = Arc::new(ToolRegistry::new());
-    registry.register(Add(fx.tool.clone()));
+    registry.register(Add(fx.tool.clone(), Default::default()));
     registry.register_arc_owned(
         Arc::new(crate::extensions::pruner::ToolHistoryQuery),
         Some("context_prune"),

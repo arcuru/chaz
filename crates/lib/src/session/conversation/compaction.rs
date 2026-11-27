@@ -152,7 +152,7 @@ pub(super) fn validate_selection(
     targets: &[RepresentationId],
 ) -> Result<()> {
     let mut rest = targets;
-    for group in selected.context_groups()? {
+    for group in selected.context_groups(None)? {
         if group.representation.as_ref() == Some(input) {
             if !targets.is_empty() && rest.is_empty() {
                 return Ok(());

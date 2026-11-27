@@ -20,12 +20,12 @@ use super::record::{
 pub(in crate::session) use super::turn::AcceptedInput;
 pub(in crate::session) use super::{
     compaction::{Intent as CompactionIntent, Settlement as CompactionSettlement},
-    provenance::{Accounting, CallStatus, Observation},
+    provenance::{Accounting, CallStatus, ModelExecution, Observation},
     record::{MessageRole, NativeResponse, Payload, ToolCallId, ToolExecutionId, View},
     turn::{AcceptedValue, Completion},
 };
 
-async fn atom_in(store: &impl ReadAtoms, value: &impl Serialize) -> Result<()> {
+pub(super) async fn atom_in(store: &impl ReadAtoms, value: &impl Serialize) -> Result<()> {
     let text = atom::encode(value)?;
     store.doc().set(atom::key(&text), text).await?;
     Ok(())
@@ -38,16 +38,41 @@ pub(in crate::session) async fn stage_descriptor(
     at: &Snapshot,
     compaction: bool,
 ) -> Result<()> {
+    stage_contract(
+        txn,
+        db,
+        at,
+        if compaction {
+            contract::FENCED_COMPACTION
+        } else {
+            contract::FENCED_INPUT_APPENDS
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(in crate::session) async fn stage_pinned_descriptor(
+    txn: &Transaction,
+    db: &Database,
+    at: &Snapshot,
+) -> Result<()> {
+    stage_contract(txn, db, at, contract::PINNED_EXECUTIONS).await
+}
+
+#[cfg(test)]
+async fn stage_contract(
+    txn: &Transaction,
+    db: &Database,
+    at: &Snapshot,
+    capability: &str,
+) -> Result<()> {
     let mut required_operations = std::collections::BTreeSet::from([
         "append-v1".into(),
         "replace-v1".into(),
         contract::FENCED_TURN.into(),
     ]);
-    required_operations.insert(if compaction {
-        contract::FENCED_COMPACTION.into()
-    } else {
-        contract::FENCED_INPUT_APPENDS.into()
-    });
+    required_operations.insert(capability.into());
     atom_in(
         &txn.get_store::<contract::ContractStore>(contract::STORE)
             .await?,
@@ -96,7 +121,10 @@ impl<'a> Staging<'a> {
         txn: &'a Transaction,
         branch: &'a str,
     ) -> Result<Self> {
-        let read = Box::pin(open(db, at, txn)).await?;
+        // The write side can already contain staged atoms from this model
+        // call. Validate the original accepted cut, not those pending writes.
+        let input = db.new_transaction_at(at).await?;
+        let read = Box::pin(open(db, at, &input)).await?;
         read.effective()?;
         Ok(Self {
             read,
@@ -124,6 +152,12 @@ impl<'a> Staging<'a> {
     }
 
     pub async fn append(&self, facts: Vec<(Payload, View)>) -> Result<Operation> {
+        let op = self.new_append(facts)?;
+        self.stage(&op).await?;
+        Ok(op)
+    }
+
+    fn new_append(&self, facts: Vec<(Payload, View)>) -> Result<Operation> {
         let mut op = self.operation(OperationKind::Append, Vec::new())?;
         for (index, (payload, view)) in facts.into_iter().enumerate() {
             let index = u32::try_from(index)
@@ -138,7 +172,6 @@ impl<'a> Staging<'a> {
                 decoder_version: 1,
             });
         }
-        self.stage(&op).await?;
         Ok(op)
     }
 
@@ -189,6 +222,10 @@ impl<'a> Staging<'a> {
         self.read.context()
     }
 
+    pub fn context_for(&self, agent: &str) -> Result<SessionContextView> {
+        self.read.context_for(agent)
+    }
+
     async fn stage(&self, op: &Operation) -> Result<()> {
         view::validate_at_observed(op, &self.read.operations, &self.read.legacy)?;
         atom_in(&self.txn.get_store::<ConversationStore>(STORE).await?, op).await
@@ -196,6 +233,88 @@ impl<'a> Staging<'a> {
 }
 
 impl Staging<'_> {
+    #[cfg(test)]
+    pub async fn stage_fixture_op(&self, op: &Operation) -> Result<()> {
+        self.stage(op).await
+    }
+
+    /// This Agent's unique pin at the observed tips.
+    #[cfg(test)]
+    pub fn agent_pin(
+        &self,
+        agent: &eidetica::entry::ID,
+    ) -> Result<(eidetica::entry::ID, super::RecordRef)> {
+        self.read
+            .agent_pin(&agent.to_string())?
+            .map(|(id, config)| (id.clone(), config.clone()))
+            .ok_or_else(|| ConversationError::Missing("Agent is not pinned in this Session".into()))
+    }
+
+    /// Stage a local input, its acceptance and the Started attempt in this
+    /// transaction. A Session write is a reason to inspect, not to respond:
+    /// while any input accepted under this Agent's pins has an unsettled
+    /// attempt, the Agent owes nothing new. Its own reply, a repeated wake or
+    /// a retry after a lost acknowledgement finds that attempt and stops.
+    #[cfg(test)]
+    pub async fn accept_pinned_input(
+        &self,
+        entry: crate::session::SessionEntry,
+        agent: &eidetica::entry::ID,
+        pin: eidetica::entry::ID,
+    ) -> Result<(Operation, AcceptedInput, crate::session::TurnAttempt)> {
+        use crate::session::{TURN_ATTEMPTS_STORE, TurnAttempt, TurnAttemptStatus};
+        super::turn::require_local_input(&entry)?;
+        let attempts = self
+            .txn
+            .get_store::<eidetica::store::Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        for attempt in self.read.agent_attempts(&agent.to_string()) {
+            let settled = attempts
+                .get(attempt)
+                .await
+                .is_ok_and(|row| row.status == TurnAttemptStatus::Completed);
+            if !settled {
+                return Err(ConversationError::IdentityConflict(
+                    "Agent has an unsettled attempt; inspect it, do not dispatch again".into(),
+                ));
+            }
+        }
+        let mut op = self.new_append(vec![(
+            Payload::Input {
+                sender: entry.sender,
+                text: entry.content,
+            },
+            View::Message(MessageRole::User),
+        )])?;
+        // A v1 grouping key is still required by the legacy view machinery;
+        // it is derived, never a selectable execution lineage.
+        op.branch_id = format!("conversation:{}", op.op_id);
+        let accepted = AcceptedInput {
+            fact: op.fact_id(0),
+            branch: op.branch_id.clone(),
+            attempt: op.op_id.clone(),
+            pin: Some(pin),
+        };
+        let attempt = TurnAttempt {
+            attempt_id: accepted.attempt.clone(),
+            request_id: crate::session::TurnRequestId::parse(accepted.request()),
+            started_at: entry.timestamp,
+            generation: 1,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        self.stage(&op).await?;
+        stage_observation(
+            self.txn,
+            Observation::InputAccepted {
+                input: accepted.clone(),
+            },
+        )
+        .await?;
+        attempts.set(&attempt.attempt_id, attempt.clone()).await?;
+        Ok((op, accepted, attempt))
+    }
+
     #[cfg(test)]
     pub fn has_branch(&self, branch: &str) -> bool {
         self.read

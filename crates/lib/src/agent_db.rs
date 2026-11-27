@@ -20,18 +20,22 @@
 mod providers;
 pub use providers::{ProviderRef, select_providers};
 
+use crate::agent_record::Stored;
 use crate::config::{AgentConfig, AgentPreset, WorkerConfig};
 use crate::grants::Grants;
 use crate::routine::Trigger;
 use crate::routine::types::next_interval_fire;
+use crate::session::RecordRef;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use eidetica::AccountSession;
 use eidetica::Database;
+use eidetica::Snapshot;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::crdt::doc::{List, Value};
 use eidetica::entry::ID;
+use eidetica::instance::InstanceError;
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +76,56 @@ pub struct ExecutorRef {
 }
 
 const BLOB_KEY: &str = "value";
+
+/// Why a bound config read returned nothing. None of these fall back to the
+/// current config or to the default one.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BoundConfigError {
+    #[error("Agent config is absent at the selected frontier")]
+    Missing,
+    #[error("Agent config read is not authorized: {0}")]
+    Unauthorized(String),
+    #[error("unsupported Agent config: {0}")]
+    Unsupported(String),
+    #[error("Agent config reference is out of scope: {0}")]
+    InvalidScope(String),
+    #[error("Agent config integrity: {0}")]
+    Integrity(String),
+    /// The needed database or history is not held here, or could not be read.
+    #[error("Agent config is unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl From<eidetica::Error> for BoundConfigError {
+    fn from(error: eidetica::Error) -> Self {
+        // The service returns an auth refusal as Io, its kind only in the text.
+        let remote = matches!(&error, eidetica::Error::Io(io)
+            if io.to_string().starts_with("[auth::"));
+        if remote || error.is_authentication_error() || error.is_permission_denied() {
+            Self::Unauthorized(error.to_string())
+        } else {
+            Self::Unavailable(error.to_string())
+        }
+    }
+}
+
+impl BoundConfigError {
+    /// Storage failures keep their category; anything else is a bad record.
+    fn record(error: anyhow::Error) -> Self {
+        if error
+            .downcast_ref::<crate::agent_record::UnsupportedVersion>()
+            .is_some()
+        {
+            return Self::Unsupported(format!("{error:#}"));
+        }
+        match error.downcast::<eidetica::Error>() {
+            // A present value of the wrong type is not an unavailable one.
+            Ok(error @ eidetica::Error::Store(_)) => Self::Integrity(error.to_string()),
+            Ok(error) => error.into(),
+            Err(error) => Self::Integrity(format!("{error:#}")),
+        }
+    }
+}
 
 /// Display metadata for an agent. Surfaced in UI; not load-bearing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -679,6 +733,91 @@ impl AgentDb {
         let cfg = crate::agent_record::read_in(txn, CONFIG_STORE).await?;
         crate::agent_bundle::validate(&cfg)?;
         Ok(cfg)
+    }
+
+    /// Read the config at one accepted frontier with a reference to the exact
+    /// stored record. Unlike [`Self::read_config_at`], absence is an error.
+    ///
+    /// The reference identifies a revision; it is not a grant, and it does not
+    /// prove the absence of a revocation this handle has not seen.
+    pub async fn read_config_bound(
+        &self,
+        at: &Snapshot,
+    ) -> Result<(AgentDbConfig, RecordRef), BoundConfigError> {
+        // First, because a permission check may verify pending entries.
+        self.require_accepted(at).await?;
+        // Any level can read. The service checks a remote handle's identity on
+        // each read; a local one is otherwise unchecked.
+        if self.database.backend()?.local_engine().is_some() {
+            self.database.current_permission().await?;
+        }
+        let txn = self.database.new_transaction_at(at).await?;
+        let record = Stored::read_in(&txn, CONFIG_STORE)
+            .await
+            .map_err(BoundConfigError::record)?
+            .ok_or(BoundConfigError::Missing)?;
+        let reference = RecordRef {
+            database: self.id().to_string(),
+            frontier: at.clone(),
+            store: CONFIG_STORE.into(),
+            record_digest: record.digest().map_err(BoundConfigError::record)?,
+            logical_id: crate::agent_record::KEY.into(),
+            member: None,
+            format: 1,
+        };
+        let cfg = record
+            .decode(CONFIG_STORE)
+            .map_err(BoundConfigError::record)?;
+        crate::agent_bundle::validate(&cfg).map_err(BoundConfigError::record)?;
+        Ok((cfg, reference))
+    }
+
+    /// Read exactly the referenced config revision, or fail.
+    pub async fn read_config_ref(
+        &self,
+        reference: &RecordRef,
+    ) -> Result<AgentDbConfig, BoundConfigError> {
+        if !reference.is_agent_config() {
+            return Err(BoundConfigError::Unsupported(
+                "not a config record reference".into(),
+            ));
+        }
+        if reference.database != self.id().to_string() {
+            return Err(BoundConfigError::InvalidScope(
+                "reference names another Agent database".into(),
+            ));
+        }
+        let (cfg, found) = self.read_config_bound(&reference.frontier).await?;
+        if found != *reference {
+            return Err(BoundConfigError::Integrity(
+                "stored record differs from its reference".into(),
+            ));
+        }
+        Ok(cfg)
+    }
+
+    /// Distinguish history not held here from history that was never accepted.
+    async fn require_accepted(&self, at: &Snapshot) -> Result<(), BoundConfigError> {
+        if at.is_empty() {
+            return Err(BoundConfigError::InvalidScope("empty frontier".into()));
+        }
+        for tip in at.tips() {
+            match self.database.get_entry(tip.clone()).await {
+                Ok(_) => {}
+                Err(eidetica::Error::Instance(error))
+                    if matches!(*error, InstanceError::EntryNotInDatabase { .. }) =>
+                {
+                    return Err(BoundConfigError::InvalidScope(error.to_string()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        crate::session::Session::require_accepted_history_frontier(&self.database, at)
+            .await
+            .map_err(|error| match error.downcast::<eidetica::Error>() {
+                Ok(error) => error.into(),
+                Err(error) => BoundConfigError::InvalidScope(error.to_string()),
+            })
     }
 
     pub async fn write_config(&self, cfg: &AgentDbConfig) -> anyhow::Result<()> {
@@ -1529,6 +1668,194 @@ mod tests {
         assert_eq!(cfg.presets["deep"].max_spawn_depth, None);
         assert_eq!(cfg.workers[0].max_spawn_depth, None);
         assert_eq!(cfg.workers[0].presets["deep"].max_spawn_depth, None);
+    }
+
+    #[tokio::test]
+    async fn bound_config_reads_one_revision_and_keeps_failures_distinct() {
+        use BoundConfigError::*;
+        let (mut user, agent) = peer_with_agent_db().await;
+        let db = agent.database();
+        let at = db.snapshot().await.unwrap();
+        let first = agent.read_config().await.unwrap();
+        let (cfg, reference) = agent.read_config_bound(&at).await.unwrap();
+        assert_eq!(cfg, first);
+        assert_eq!(reference.frontier, at);
+
+        let second = AgentDbConfig {
+            system_prompt: "second".into(),
+            ..Default::default()
+        };
+        agent.write_config(&second).await.unwrap();
+        assert_eq!(agent.read_config_ref(&reference).await.unwrap(), first);
+        let now = db.snapshot().await.unwrap();
+        let (cfg, current) = agent.read_config_bound(&now).await.unwrap();
+        assert_eq!(cfg, second);
+        assert_ne!(current.record_digest, reference.record_digest);
+        assert_eq!(db.snapshot().await.unwrap(), now, "reads write nothing");
+
+        let set = async |value: Value| {
+            let txn = db.new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(CONFIG_STORE).await.unwrap();
+            store.set("value", value).await.unwrap();
+            txn.commit().await.unwrap();
+            let at = db.snapshot().await.unwrap();
+            agent.read_config_bound(&at).await.unwrap_err()
+        };
+        let mut newer = Doc::atomic();
+        newer.set("version", 2i64);
+        newer.set("fields", Doc::new());
+        assert!(matches!(set(Value::Doc(newer)).await, Unsupported(_)));
+        for corrupt in [Value::Int(42), Value::Doc(Doc::new()), "{".into()] {
+            assert!(matches!(set(corrupt).await, Integrity(_)));
+        }
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(CONFIG_STORE).await.unwrap();
+        store.delete("value").await.unwrap();
+        txn.commit().await.unwrap();
+        let deleted = db.snapshot().await.unwrap();
+        let root = Snapshot::from([agent.id()]);
+        for absent in [&deleted, &root] {
+            assert_eq!(agent.read_config_bound(absent).await, Err(Missing));
+            assert_eq!(
+                agent.read_config_at(absent).await.unwrap(),
+                AgentDbConfig::default(),
+                "the unbound read still defaults"
+            );
+        }
+
+        let edited = async |edit: fn(&mut RecordRef)| {
+            let mut reference = reference.clone();
+            edit(&mut reference);
+            agent.read_config_ref(&reference).await.unwrap_err()
+        };
+        assert!(matches!(edited(|r| r.format = 2).await, Unsupported(_)));
+        assert!(matches!(
+            edited(|r| r.member = Some(0)).await,
+            Unsupported(_)
+        ));
+        assert!(matches!(
+            edited(|r| r.store = "meta".into()).await,
+            Unsupported(_)
+        ));
+        assert!(matches!(
+            edited(|r| r.database = "x".into()).await,
+            InvalidScope(_)
+        ));
+        assert!(matches!(
+            edited(|r| r.record_digest = "0".repeat(64)).await,
+            Integrity(_)
+        ));
+        assert!(matches!(
+            edited(|r| r.frontier = Snapshot::from([ID::from_bytes(b"unheld")])).await,
+            Unavailable(_)
+        ));
+        let key = user.get_default_key().unwrap();
+        let other = user.create_database(Doc::new(), &key).await.unwrap();
+        assert!(matches!(
+            agent
+                .read_config_bound(&other.snapshot().await.unwrap())
+                .await,
+            Err(InvalidScope(_))
+        ));
+        // Stored but not accepted is out of scope, whatever the handle allows.
+        agent.write_config(&first).await.unwrap();
+        let unaccepted = db.snapshot().await.unwrap();
+        db.instance()
+            .unwrap()
+            .demote_to_unverified(db.root_id(), &unaccepted.tips()[0])
+            .await
+            .unwrap();
+        let diagnostic = AgentDb::from_database(db.clone().allow_unverified());
+        assert!(matches!(
+            diagnostic.read_config_bound(&unaccepted).await,
+            Err(InvalidScope(_))
+        ));
+
+        // A local handle needs a member key, though storage would serve it.
+        let stranger = eidetica::PrivateKey::generate();
+        let keyless = Database::open(&db.instance().unwrap(), db.root_id())
+            .await
+            .unwrap();
+        for handle in [keyless.clone(), keyless.with_key(stranger)] {
+            assert!(matches!(
+                AgentDb::from_database(handle)
+                    .read_config_ref(&reference)
+                    .await,
+                Err(Unauthorized(_))
+            ));
+        }
+        assert_eq!(agent.read_config_ref(&reference).await.unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn bound_config_service_reader_needs_only_read_and_keeps_its_refusal() {
+        use eidetica::auth::types::{AuthKey, Permission, SigKey};
+        let (owner, agent) = peer_with_agent_db().await;
+        let host = agent.database().instance().unwrap();
+        let at = agent.database().snapshot().await.unwrap();
+        owner
+            .admin()
+            .await
+            .unwrap()
+            .create_account(NewAccount::with_password("reader", "test-password"))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("service.sock");
+        let server = eidetica::service::ServiceServer::bind(host, &socket)
+            .await
+            .unwrap();
+        let (shutdown, receiver) = tokio::sync::watch::channel(());
+        let task = tokio::spawn(server.run(receiver));
+        let client = Instance::connect(format!("unix://{}", socket.display()))
+            .await
+            .unwrap();
+        client
+            .login_account("reader", "test-password")
+            .await
+            .unwrap();
+        let key = eidetica::PrivateKey::generate();
+        let public = key.public_key();
+        let grant = async |auth| {
+            let txn = agent.database().new_transaction().await.unwrap();
+            let settings = txn.get_settings().unwrap();
+            settings.set_auth_key(&public, auth).await.unwrap();
+            txn.commit().await.unwrap();
+        };
+        grant(AuthKey::active(Some("reader"), Permission::Read)).await;
+        // Creating its own database proves possession of the key to the service.
+        Database::create(&client, key.clone(), Doc::new())
+            .await
+            .unwrap();
+        let remote = Database::open_remote(
+            &client,
+            client.remote_connection().unwrap(),
+            &agent.id(),
+            SigKey::from_pubkey(&public),
+        )
+        .await
+        .unwrap()
+        .with_key(key);
+        assert!(remote.backend().unwrap().local_engine().is_none());
+        let remote = AgentDb::from_database(remote);
+        let (cfg, reference) = remote.read_config_bound(&at).await.unwrap();
+        assert_eq!(cfg, agent.read_config().await.unwrap());
+        assert_eq!(agent.read_config_ref(&reference).await.unwrap(), cfg);
+
+        let txn = agent.database().new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .revoke_auth_key(&public)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(matches!(
+            remote.read_config_ref(&reference).await,
+            Err(BoundConfigError::Unauthorized(_))
+        ));
+        assert_eq!(agent.read_config_ref(&reference).await.unwrap(), cfg);
+        drop(shutdown);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ mod atom;
 mod compaction;
 pub(super) mod contract;
 mod legacy;
+pub(super) mod pins;
 mod provenance;
 mod record;
 mod turn;
@@ -13,6 +14,7 @@ pub(super) mod staging;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use atom::canonical_json;
 pub use provenance::{CallInput, CallMessageBinding, Fidelity, RecordRef};
 pub use record::{CallId, FactId, ObservedBinding, RepresentationId};
 
@@ -116,6 +118,7 @@ pub struct ConversationInspection {
     pub descriptor: ConversationOriginals,
     pub operations: ConversationOriginals,
     pub provenance: ConversationOriginals,
+    pub pins: ConversationOriginals,
     pub issues: Vec<ConversationError>,
 }
 
@@ -175,6 +178,8 @@ pub(super) struct ConversationRead {
     fenced_turn: bool,
     fenced_compaction: bool,
     fenced_input_appends: bool,
+    pinned_executions: bool,
+    pins: pins::Pins,
     legacy_frontier: Option<Snapshot>,
     descriptor_entries: BTreeSet<ID>,
     locations: BTreeMap<ID, BTreeSet<String>>,
@@ -195,9 +200,80 @@ impl ConversationRead {
         view::effective(&self.operations, &self.legacy)
     }
 
+    pub(super) fn agent_pin(&self, agent: &str) -> Result<Option<(&ID, &RecordRef)>> {
+        if let Some(error) = self.inspection.issues.first() {
+            return Err(error.clone());
+        }
+        if !self.pinned_executions {
+            return Err(ConversationError::Unsupported("session Agent pins".into()));
+        }
+        self.pins.current(agent)
+    }
+
+    /// Attempt IDs of every input accepted under one of this Agent's pins.
+    #[cfg(test)]
+    pub(super) fn agent_attempts<'a>(&'a self, agent: &'a str) -> impl Iterator<Item = &'a str> {
+        self.provenance
+            .inputs
+            .values()
+            .filter_map(move |(_, input)| {
+                let config = self.pins.config(input.pin.as_ref()?)?;
+                (config.database == agent).then_some(input.attempt.as_str())
+            })
+    }
+
+    pub(super) fn accepted_agent_pin(
+        &self,
+        accepted_entry: &ID,
+    ) -> Result<Option<(&ID, &RecordRef)>> {
+        if let Some(error) = self.inspection.issues.first() {
+            return Err(error.clone());
+        }
+        Ok(self.provenance.inputs.values().find_map(|(entry, input)| {
+            let pin = input.pin.as_ref().filter(|_| entry == accepted_entry)?;
+            Some((pin, self.pins.config(pin)?))
+        }))
+    }
+
     pub(super) fn context(&self) -> Result<SessionContextView> {
+        self.context_with(None)
+    }
+
+    /// Context for one pinned Agent: other Agents' executions appear only as
+    /// their named publications, never as this Agent's own turns.
+    pub(super) fn context_for(&self, agent: &str) -> Result<SessionContextView> {
+        if !self.pinned_executions {
+            return Err(ConversationError::Unsupported(
+                "Agent reader without pinned executions".into(),
+            ));
+        }
+        self.context_with(Some(&view::Reader {
+            agent,
+            authors: self.authors(),
+            names: &self.provenance.senders,
+        }))
+    }
+
+    /// Operation ID → Agent DB ID, through each accepted input's own pin.
+    fn authors(&self) -> BTreeMap<&str, &str> {
+        let branches: BTreeMap<_, _> = self
+            .provenance
+            .inputs
+            .values()
+            .filter_map(|(_, input)| {
+                let config = self.pins.config(input.pin.as_ref()?)?;
+                Some((input.branch.as_str(), config.database.as_str()))
+            })
+            .collect();
+        self.operations
+            .iter()
+            .filter_map(|(id, op)| Some((id.as_str(), *branches.get(op.branch_id.as_str())?)))
+            .collect()
+    }
+
+    fn context_with(&self, reader: Option<&view::Reader<'_>>) -> Result<SessionContextView> {
         Ok(SessionContextView {
-            groups: self.effective()?.context_groups()?,
+            groups: self.effective()?.context_groups(reader)?,
             contributions: self.legacy.contributions.clone(),
             read_only: true,
             receipts: self.legacy.receipts.clone(),
@@ -209,7 +285,7 @@ impl ConversationRead {
     pub(super) fn display_rows(&self) -> Result<Vec<DisplayRow>> {
         Ok(self
             .effective()?
-            .display_rows(&self.provenance.reply_targets))
+            .display_rows(&self.provenance.reply_targets, &self.provenance.senders))
     }
 
     pub(super) fn recorded_call(&self, call: &CallId, attempt: &str) -> Result<Option<&CallInput>> {
@@ -222,6 +298,17 @@ impl ConversationRead {
             .provenance
             .calls
             .get(&(call.clone(), attempt.to_owned())))
+    }
+
+    pub(super) fn recorded_call_entry(&self, entry: &ID) -> Result<Option<&CallInput>> {
+        if let Some(issue) = self.inspection.issues.first() {
+            return Err(issue.clone());
+        }
+        Ok(self
+            .provenance
+            .model_entries
+            .get(entry)
+            .and_then(|key| self.provenance.calls.get(key)))
     }
 
     pub(super) fn accounting(&self) -> Result<Vec<super::usage::CallEvidence>> {
@@ -322,11 +409,14 @@ pub(super) async fn open(
     let fenced_input_appends = descriptor
         .as_ref()
         .is_some_and(contract::Descriptor::fenced_input_appends);
+    let pinned_executions = descriptor
+        .as_ref()
+        .is_some_and(contract::Descriptor::pinned_executions);
     let legacy_frontier = descriptor.as_ref().map(|d| d.legacy.frontier.clone());
-    let legacy = if let Some(descriptor) = descriptor.filter(|_| contract.issues.is_empty()) {
+    let mut legacy = if let Some(descriptor) = descriptor.filter(|_| contract.issues.is_empty()) {
         match contract::require_unchanged_legacy(db, frontier, &descriptor.legacy, &ancestry).await
         {
-            Ok(()) => match legacy::at(db, &descriptor.legacy).await {
+            Ok(()) => match Box::pin(legacy::at(db, &descriptor.legacy)).await {
                 Ok(legacy) => legacy,
                 Err(error) => {
                     contract.issues.push(error);
@@ -346,6 +436,7 @@ pub(super) async fn open(
         }
         legacy::LegacyView::default()
     };
+    legacy.group_concurrent_tool_results = pinned_executions;
     let mut read = ConversationRead {
         inspection: ConversationInspection {
             descriptor: contract.data,
@@ -356,6 +447,8 @@ pub(super) async fn open(
         fenced_turn,
         fenced_compaction,
         fenced_input_appends,
+        pinned_executions,
+        pins: Default::default(),
         legacy_frontier,
         descriptor_entries,
         locations: BTreeMap::new(),
@@ -363,6 +456,10 @@ pub(super) async fn open(
         op_atoms: BTreeMap::new(),
         provenance: Default::default(),
     };
+    let (pins, pin_originals) = pins::read(db, frontier, txn, &ancestry, &read).await?;
+    read.pins = pins;
+    read.inspection.pins = pin_originals.data;
+    read.inspection.issues.extend(pin_originals.issues);
     let entries = entries(db, STORE, frontier).await?;
     let mut originals = Originals::default();
     let mut occurrences = Vec::new();
@@ -404,6 +501,8 @@ pub(super) async fn open(
             let check = async {
                 let parents = ancestry.prefix(&Snapshot::from(entry.parents()?))?;
                 if op.observed.database != db.root_id().to_string()
+                    || (pinned_executions
+                        && op.observed.frontier != Snapshot::from(entry.parents()?))
                     || !op
                         .observed
                         .frontier

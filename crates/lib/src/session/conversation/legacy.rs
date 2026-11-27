@@ -59,6 +59,7 @@ pub(super) struct LegacyEntry {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct LegacyView {
+    pub(super) group_concurrent_tool_results: bool,
     pub entries: Vec<LegacyEntry>,
     pub contributions: Vec<CommittedContribution>,
     pub receipts: Vec<String>,
@@ -175,6 +176,7 @@ pub(super) async fn at(db: &Database, boundary: &LegacyBoundary) -> Result<Legac
         });
     }
     Ok(LegacyView {
+        group_concurrent_tool_results: false,
         entries,
         contributions,
         receipts,
