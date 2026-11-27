@@ -380,13 +380,7 @@ impl ContextTail for MemoryContextTail {
 
             // Collect bank names to search: persistent grants + session-scoped attachments
             let mut bank_names: Vec<String> = Vec::new();
-            if let Ok(bank_refs) =
-                crate::agent_db::read_blob::<Vec<crate::agent_db::MemoryBankRef>>(
-                    db,
-                    crate::agent_db::MEMORY_BANKS_STORE,
-                )
-                .await
-            {
+            if let Ok(bank_refs) = agent_db.list_memory_banks().await {
                 for bref in &bank_refs {
                     bank_names.push(bref.name.clone());
                 }
@@ -1785,6 +1779,64 @@ mod tests {
         assert_error(
             cmd.grant_cmd("patrick alpha wat").await,
             "Unknown permission",
+        );
+    }
+
+    /// A persistent grant recorded in the native Table alone (no session
+    /// attachment) must feed agent-wide auto-recall, and must stop doing so
+    /// once revoked.
+    #[tokio::test]
+    async fn table_granted_bank_contributes_to_agent_wide_auto_recall() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        cmd.new_cmd("granted").await;
+        // Persistent agent-wide grant through the ordinary native Table
+        // path (/memory grant → AgentDb::attach_memory_bank).
+        cmd.grant_cmd("granted alpha write").await;
+        let access = access_for(&cmd);
+        access
+            .remember(
+                "alpha",
+                "lighthouse",
+                "zephyr-lantern-sentinel marks the lighthouse",
+                MemoryScope::Bank {
+                    name: "granted".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let caller = cmd.agent_index.find_by_name("alpha").unwrap();
+        let tail = MemoryContextTail {
+            registry: registry.clone(),
+            agent_index: cmd.agent_index.clone(),
+            memory_bank_index: cmd.memory_bank_index.clone(),
+            embedder: None,
+            // No per-session attachment: the grant alone must drive recall.
+            session_attached_banks: vec!["absent".into()],
+        };
+        let recent = vec!["what about the lighthouse".into()];
+        let call = crate::extension::caps::ContextTailCall {
+            agent_name: "alpha",
+            agent_identity: Some(&caller),
+            recent_message_text: &recent,
+            session_db_id: Some("synthetic-session".into()),
+            request_id: Some("synthetic-request"),
+        };
+        let text = tail.context_tail(&call).await.unwrap();
+        let text = text.unwrap_or_default();
+        println!("TABLE_GRANT_RECALL {text}");
+        assert!(text.contains("zephyr-lantern-sentinel"), "{text}");
+        assert!(text.contains("(from bank: granted)"), "{text}");
+
+        // Revoked-reference control: after revoke the sentinel content
+        // must be absent.
+        assert_text(cmd.revoke_cmd("granted alpha").await, "granted");
+        let revoked = tail.context_tail(&call).await.unwrap().unwrap_or_default();
+        println!("TABLE_GRANT_REVOKED {revoked}");
+        assert!(
+            !revoked.contains("zephyr-lantern-sentinel"),
+            "revoked grant must not recall bank content: {revoked}"
         );
     }
 
