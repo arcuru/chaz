@@ -341,7 +341,7 @@ impl SessionOps for LiveSessions {
         attach_once(
             &self.attached,
             &db,
-            room,
+            super::super::RoomTarget::timeline(room),
             &self.server,
             &self.login_id,
             &self.owning_agent,

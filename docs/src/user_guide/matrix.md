@@ -283,10 +283,11 @@ Safety notes:
    is not enough. Without a mention, eligible text in an attached group is context
    only unless [participation](#choosing-when-to-wake-in-a-group) is on. `!chaz`
    starts a command, not a prompt with room context.
-3. Both messages use their **room's** session. A thread is not a session selector:
-   thread-per-session mode is unmerged, and the
-   [workspace](#personal-workspace-space-lobby-and-named-chats) offers named chat
-   rooms, not a threaded Inbox.
+3. In either case, normal mode uses the **room's** session. If you enable
+   [threaded-sessions mode](#room-modes-one-session-per-thread), each allowed
+   top-level text message starts a separate session and gets a reply in its own
+   thread, with no mention needed. [Workspace chats](#personal-workspace-space-lobby-and-named-chats)
+   always use their own room bindings.
 
 If an encrypted room stays silent, look for `Could not decrypt a message; it is
 ignored` in the bridge log. Check the sender device's cross-signature and room-key
@@ -318,6 +319,16 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz context`                  | Context-window usage for this room's agent                                                   |
 | `!chaz print`                    | Show session history in the room, including messages from local clients                      |
 | `!chaz stop`                     | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
+
+### Room modes
+
+| Command                             | Description                                                        |
+| ----------------------------------- | ------------------------------------------------------------------ |
+| `!chaz room mode`                   | Report how this room routes messages                               |
+| `!chaz room mode normal`            | One room-wide session, replies on the main timeline (the default)  |
+| `!chaz room mode threaded-sessions` | One session per top-level message, each answered in its own thread |
+
+Send these on the room's main timeline, not inside a thread — a mode belongs to the whole room. The sender must pass the login's `allow_list`, the same as every other command. Workspace rooms keep their fixed routing and do not support this toggle. See [Room Modes](#room-modes-one-session-per-thread) for what each mode actually does.
 
 ### Living Agents
 
@@ -399,6 +410,9 @@ create a fresh session. If the room itself belongs to multiple sessions, the
 error lists their DB IDs: use `!chaz detach <exact-session-db-id>` to remove
 one explicitly. Names and guessed IDs cannot disambiguate it. Errors are
 reported rather than claiming detach succeeded.
+
+In `threaded-sessions` mode each managed thread is its own attachment. Its
+channel combines the room ID with the root event ID, not a session name.
 
 | Action                                     | Effect                                                                                                       |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
@@ -578,6 +592,120 @@ Example in an allowlisted group room:
    restore it and explicitly enable again.
 5. `!chaz participation off` reports `Matrix participation: off`. Bare
    messages return to observation-only; mentions still start turns.
+
+## Room Modes: One Session per Thread
+
+A room's _mode_ decides what a message in it means. There are two, and `normal` is the default, so a room you never configure behaves exactly as it always has.
+
+**`normal`** — one room-wide session. Authorized messages addressed to the bot share one conversation, and replies appear on the main timeline.
+
+**`threaded-sessions`** — each authorized top-level text message opens a separate session, and the bot answers in a Matrix thread rooted at that message. Commands do not open threads. Each thread has its own history and model. Session aliases, whether set by `!chaz name` or automatic naming, stay in Chaz: they do not change the Matrix room name or appear in bot notices.
+
+What's automatic and what you touch:
+
+- **Automatic**: session creation, the thread the reply lands in, and which session a thread reply continues. You never name a session to talk to it — you reply in its thread.
+- **Yours**: the mode itself (`!chaz room mode …`), and per-session settings inside a thread (`!chaz model`, `!chaz name`, `!chaz compact`, …).
+- **No mention needed.** A `threaded-sessions` room is dedicated to the bot, so a bare top-level message is addressed to it by definition. The login's `allow_list` still applies, and bot-originated and non-text events never open a session.
+
+Where the state lives:
+
+- **The mode** is stored per `(login, room)` in the bridge's own settings database — durable across restarts, and deliberately _not_ in any session's LLM context. It is an operator setting, not something the model can see or change.
+- **A thread's session identity** is the triple `(login, room, root event ID)`, recorded as a transport binding in the session's own eidetica database. Because it is durable and root-keyed rather than in-memory, a thread survives a bridge restart, a daemon restart, and a later mode change.
+
+Everything a thread's session produces stays in that thread: assistant replies, session-command output, tool-approval prompts, expiry notices, and approval acknowledgements. `!chaz approve` inside a thread answers _that_ thread's oldest pending prompt and cannot reach across to a sibling's.
+
+Failure modes worth knowing:
+
+- **Switching to `threaded-sessions` detaches an existing room-wide session.** It is detached, never deleted — it stays listed in `!chaz sessions` and you can rebind it later with `!chaz attach`. The bot tells you the ID it detached. Pending approvals and later output from that old session no longer appear in this room.
+- **Switching back to `normal` does not strand your threads.** It stops _new_ top-level messages from opening threads; every thread already open keeps working, replies included. It also does not re-attach the session that was detached — do that yourself with `!chaz attach <id>` if you want it back.
+- **`attach`, `detach` and `participation` are refused** inside a thread, and at the top level of a `threaded-sessions` room. All three act on the room-wide session, which is not the session you are looking at (in a thread) or is one the mode deliberately removed (at the top level). Thread-scoped rebinding is not designed yet, so the bot explains instead of guessing. A thread is addressed by definition, so ambient participation has nothing to add there.
+- **A session command at the top level of a `threaded-sessions` room is refused** for the same reason: there is no room-wide session for it to act on, and creating one would quietly undo the detach. Send it inside a thread. `!chaz help` and `!chaz room mode` still work there.
+- **Legacy `send` and `rename` commands are refused in thread contexts.** They use whole-room history rather than the thread's session. Send a plain message or use `!chaz name` inside a thread instead.
+- **No history backfill into a thread.** A room-wide session backfills the room's history when the bot joins; a thread's session starts from its own root message. Importing the main timeline or a neighbouring thread would be exactly the context leak per-thread sessions exist to prevent. A `threaded-sessions` room keeps the join cutoff — messages from before the bot joined still never open a thread or run a command — but imports no history into any session.
+- **`threaded-replies` is not supported.** The bot accepts only `normal` and `threaded-sessions`.
+
+### Walkthrough: Running Several Conversations in One Room
+
+1. **Turn the room into a launcher.** On the main timeline:
+
+   ```text
+   !chaz room mode threaded-sessions
+   ```
+
+   ```text
+   Room mode set to `threaded-sessions`. Detached the room-wide session
+   abc123…; it is kept in the session UI. Every new top-level message now
+   starts its own session, answered in its own thread.
+   ```
+
+   If the room had no room-wide session yet, the detach sentence is simply absent.
+
+2. **Ask two unrelated things.** Two plain top-level messages, no `!chaz`, no mention:
+
+   ```text
+   how do I rotate the deploy key?
+   ```
+
+   ```text
+   summarize the on-call handover doc
+   ```
+
+   Each gets its own thread, and the bot's answer appears inside it. Your client shows two thread summaries under the two messages.
+
+3. **Confirm they really are separate.** Reply _inside_ the first thread:
+
+   ```text
+   !chaz info
+   ```
+
+   ```text
+   Session: abc1234…
+   Agent: chaz
+   Matrix rooms: thread:!room:example.com#$rootEventIdA
+   Total entries: 4
+   Messages: 2 | Directives: 1 | Tool calls: 0 | Errors: 0
+   ```
+
+   The same command in the second thread reports a different `Session:` — and each `Matrix rooms:` line names that thread's own root event, which is what makes the binding per-thread rather than per-room.
+
+4. **Continue a conversation by replying in its thread.** No mention, no session name:
+
+   ```text
+   and what about the staging key?
+   ```
+
+   The answer lands in the same thread, on the same session. The other thread is untouched.
+
+5. **Failure and recovery — asking for the room-wide session inside a thread.**
+
+   ```text
+   !chaz detach
+   ```
+
+   ```text
+   `attach`/`detach`/`participation` act on this room's main-timeline session,
+   not a thread's session, so they are refused inside a thread. Thread-scoped
+   rebinding isn't designed yet; use `!chaz info` here to see which session
+   this thread is.
+   ```
+
+   Nothing was changed. To get a room-wide session back, revert the room on the main timeline and re-attach the session you detached in step 1:
+
+   ```text
+   !chaz room mode normal
+   ```
+
+   ```text
+   Room mode set to `normal`. New top-level messages use the room-wide session
+   again. Existing threads keep working; a previously detached session is not
+   re-attached.
+   ```
+
+   ```text
+   !chaz attach abc123…
+   ```
+
+   Your threads from steps 2–4 still work: reply in one and the bot answers there, on the same session it always had.
 
 ## Per-Session Settings
 
