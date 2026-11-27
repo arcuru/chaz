@@ -1226,7 +1226,7 @@ impl Session {
         database: &Database,
         at: &Snapshot,
         prior_legacy: Option<&Snapshot>,
-        live_write: bool,
+        previously_observed: Option<&Snapshot>,
         is_agent: impl Fn(&str) -> bool,
     ) -> anyhow::Result<(bool, Option<Snapshot>)> {
         let read = Self::history_at(database, at).await?;
@@ -1267,34 +1267,41 @@ impl Session {
         let live = HashSet::new();
         let attempts = session.read_turn_attempts_at(at).await?;
         let states = index_attempt_states(attempts, &live);
-        let mentioned = session.latest_entry_with_id().and_then(|(id, entry)| {
-            // A mention in historical agent output is not a durable request.
-            (live_write
-                && matches!(entry.entry_type, EntryType::Message)
-                && is_agent(&entry.sender)
-                && !baseline.contains(id.as_str())
-                && !states.contains_key(id))
-            .then(|| {
-                parse_mentions(&entry.content)
-                    .into_iter()
-                    .filter(|name| !name.eq_ignore_ascii_case(&entry.sender))
-                    .collect::<Vec<_>>()
-            })
-        });
-        let maybe_mention = if let Some(mentioned) = mentioned.filter(|names| !names.is_empty()) {
-            try_read_meta_at(database, at)
-                .await?
-                .agents
+        let mut maybe_mention = false;
+        if let Some(previous) = previously_observed
+            && let Some((id, entry)) = session.latest_entry_with_id()
+            && matches!(entry.entry_type, EntryType::Message)
+            && is_agent(&entry.sender)
+            && !baseline.contains(id.as_str())
+            && !states.contains_key(id)
+        {
+            let mentioned = parse_mentions(&entry.content);
+            if mentioned
                 .iter()
-                .any(|agent| {
-                    is_agent(&agent.display_name)
-                        && mentioned
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(&agent.display_name))
-                })
-        } else {
-            false
-        };
+                .any(|name| !name.eq_ignore_ascii_case(&entry.sender))
+                && try_read_meta_at(database, at)
+                    .await?
+                    .agents
+                    .iter()
+                    .any(|agent| {
+                        is_agent(&agent.display_name)
+                            && !agent.display_name.eq_ignore_ascii_case(&entry.sender)
+                            && mentioned
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(&agent.display_name))
+                    })
+            {
+                // A metadata-only write can leave the same Agent message at
+                // the tip. Require a new row, not merely a new snapshot.
+                let prior = database.new_transaction_at(previous).await?;
+                let rows = prior.get_store::<Table<SessionEntry>>("entries").await?;
+                match rows.get(id.as_str()).await {
+                    Err(error) if error.is_not_found() => maybe_mention = true,
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+            }
+        }
         let mut interrupted = HashSet::new();
         for request in session.turn_requests_with_states(is_agent, states, baseline)? {
             match request.state {
@@ -3239,16 +3246,42 @@ mod tests {
         let at = db.snapshot().await.unwrap();
         let is_agent = |name: &str| matches!(name, "alpha" | "beta");
         assert!(
-            !Session::resident_work_at(&db, &at, None, false, is_agent)
+            !Session::resident_work_at(&db, &at, None, None, is_agent)
                 .await
                 .unwrap()
                 .0
         );
+        session
+            .update_meta(|meta| meta.name = Some("renamed".into()))
+            .await
+            .unwrap();
+        let renamed = db.snapshot().await.unwrap();
+        assert_ne!(renamed, at);
         assert!(
-            Session::resident_work_at(&db, &at, None, true, is_agent)
+            !Session::resident_work_at(&db, &renamed, None, Some(&at), is_agent)
                 .await
                 .unwrap()
-                .0
+                .0,
+            "metadata must not wake an old mention"
+        );
+        session
+            .add_entry(SessionEntry {
+                content: "Would @beta check this?".into(),
+                ..entry_at("alpha", 0, None)
+            })
+            .await
+            .unwrap();
+        session
+            .update_meta(|meta| meta.name = Some("updated again".into()))
+            .await
+            .unwrap();
+        let coalesced = db.snapshot().await.unwrap();
+        assert!(
+            Session::resident_work_at(&db, &coalesced, None, Some(&renamed), is_agent)
+                .await
+                .unwrap()
+                .0,
+            "a new mention with identical text must survive a coalesced metadata write"
         );
     }
 
@@ -3263,7 +3296,7 @@ mod tests {
             .unwrap();
         let initial = db.snapshot().await.unwrap();
 
-        let (work, cutoff) = Session::resident_work_at(&db, &initial, None, false, |_| false)
+        let (work, cutoff) = Session::resident_work_at(&db, &initial, None, None, |_| false)
             .await
             .unwrap();
         assert!(!work);
@@ -3280,7 +3313,7 @@ mod tests {
             .unwrap();
         let changed = db.snapshot().await.unwrap();
         let (work, cutoff) =
-            Session::resident_work_at(&db, &changed, cutoff.as_ref(), false, |_| false)
+            Session::resident_work_at(&db, &changed, cutoff.as_ref(), None, |_| false)
                 .await
                 .unwrap();
         assert!(work);
