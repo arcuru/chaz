@@ -86,7 +86,9 @@ The responding Living Agent must have an active direct key in its invoking sessi
 
 Browsing another session records the returned excerpts in **this** conversation. Importing makes a copy readable in the destination bank; it can turn up in recall, including auto-recall. Source revocation stops future reads and refreshes; it cannot withdraw an earlier tool result or bank copy. Enable these tools only for Agents you intend to make those choices. No private session is imported just because an Agent is attached to it.
 
-Only plain `Message` rows from the supported dated session layout are eligible. Tool calls, results, directives, summaries, routing data and provider metadata aren't returned. Text is limited to 768 UTF-8 bytes, the sender to 128 bytes. The bank stores a labelled, quoted excerpt, not a generated summary or an instruction. Import calls no embedding provider. Its entries participate in lexical `recall` under the `session-excerpt` tag. A session using another history format is not interpreted as an empty dated session.
+Only plain `Message` rows from legacy session history are eligible. Tool calls, results, directives, summaries, routing data and provider metadata aren't returned. Text is limited to 768 UTF-8 bytes, the sender to 128 bytes. The bank stores a labelled, quoted excerpt, not a generated summary or an instruction. Import calls no embedding provider. Its entries participate in lexical `recall` under the `session-excerpt` tag.
+
+Browsing excerpts and importing messages both refuse sessions with [ConversationStore v1](../architecture/sessions.md#conversationstore-v1-reads-and-fenced-writer-fixtures) traces instead of falling back to legacy rows. Supporting that format requires a production writer and a `HistoryRead` API that provides stable message IDs and timestamps.
 
 ### Walkthrough: keep one message from another session
 
