@@ -16,14 +16,33 @@ This page covers the architecture and the one-time setup/approval flow common to
 both bridges. For transport-specific configuration see [Matrix Bot](matrix.md)
 and [Discord Bot](discord.md).
 
+## Which messages reach a session?
+
+|                        | Matrix                                                                                                   | Discord                                                                                                |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Who can send live text | An MXID matching the login or top-level `allow_list` regex. If both settings are absent, nobody matches. | Non-bot members of `allowed_users` (numeric IDs); an empty list allows any non-bot sender.             |
+| First ordinary text    | Send plain text in a direct chat, or use your client's mention picker in a group.                        | Send plain text in a DM **or a server channel**. No mention or prefix is required.                     |
+| Other conversation     | With participation off, eligible unaddressed group text is context only in an attached session.          | An allowed user's channel text goes to the agent even when addressed to someone else.                  |
+| Session selection      | The login and room ID select the session. Ordinary rooms support `!chaz detach` and `!chaz attach`.      | The login and channel ID select the session. A session switch in a client does not rebind the channel. |
+
+`!chaz help` asks the bridge for commands; it does not test whether an agent can answer.
+See [Matrix message handling](matrix.md#message-handling) and [Discord message
+handling](discord.md#message-handling) to try a conversation.
+
 ## What an attached session publishes
+
+The table describes Matrix's addressed-reply path. Discord still delivers ordinary
+agent messages from the bound session, including replies to turns started elsewhere.
+Matrix doesn't automatically post a TUI reply, but `!chaz print` can show that
+conversation in the room. Use a separate, unattached session for private work on
+either transport.
 
 | Event                                                      | Shared-session behavior                                                                                  |
 | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Addressed external message                                 | The attached adapter supplies source facts; core checks the binding and lets a `Message` wake the agent. |
 | Unaddressed observation                                    | Recorded for later context; it does not start a turn.                                                    |
 | Normal final for an external turn                          | If the adapter declares conversational replies, saved locally and queued to that same source.            |
-| Normal final for a TUI, CLI, schedule, or local-agent turn | Remains local even though the session has an external attachment.                                        |
+| Normal final for a TUI, CLI, schedule, or local-agent turn | Saved in the session; not automatically posted to the Matrix room.                                       |
 | `no_reply({})`                                             | Completes without a final or external post on a reply-capable attached session.                          |
 | Explicit `matrix__send`                                    | Queues a deliberate addressed message; its later final does not post twice.                              |
 
@@ -41,7 +60,7 @@ safely reopen sessions containing the new kind.
 
 Example: attach a Matrix room and ask a question there; the final posts to
 that room, and the TUI shows both the local final and the delivery receipt.
-Ask a second question from the TUI in the same session; its final stays local.
+Ask a second question from the TUI in the same session; its final is not automatically posted.
 If the room is detached before a queued reply is sent, the bridge leaves it
 pending rather than publishing it to a different room; reattach deliberately
 and inspect the interrupted or undelivered work before retrying.
@@ -184,13 +203,13 @@ A bridge reads its own YAML file — `chaz-matrix` defaults to
 kinds of keys, parsed independently:
 
 - **chaz runtime keys** the bridge's embedded server needs: `execution:`,
-  `eidetica:`, `backends:`, `agents:` (just the identities the bridge serves),
-  `security:`, and optionally `state_dir:`. These are the ordinary
-  [config](configuration.md) keys.
+  `eidetica:`, and optional settings such as `backends:`, `security:` and
+  `state_dir:` (see [Configuration](configuration.md)). Do not define agents
+  here: `logins[].agent` names an existing hosted agent.
 - **bridge-only keys**: `unlock_password:`, an optional `label:`, and a
   `logins:` list.
 
-Each entry in `logins:` ties one transport account to one agent:
+Each entry in `logins:` ties one transport account to one agent. For example:
 
 ```yaml
 # bridge-only keys
@@ -200,7 +219,11 @@ label: matrix # names the bridge's settings DB (default per transport)
 logins:
   - agent: chaz # the owning agent (its DB receives the LoginRef pointer)
     ticket: "eidetica:?db=...&pr=..." # direct owners only: access ticket for that agent's DB (see Setup)
-    # ...transport-specific credential fields (see Matrix / Discord pages)
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@chaz:example"
+    password: ${MATRIX_PASSWORD}
+    allow_list: "^@you:example$"
 
 # chaz runtime keys the embedded server needs
 state_dir: /var/lib/chaz-matrix
@@ -209,9 +232,6 @@ eidetica:
   connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
   login: { username: chaz-matrix, password: your-eidetica-password }
   sync: { iroh: true }
-backends:
-  - name: openai
-    api_key: ${OPENAI_API_KEY}
 ```
 
 Secret fields (`unlock_password`, the Matrix `password`, the Discord
@@ -287,7 +307,7 @@ is separate and granted by attachment.) The flow mirrors [`/agent import`](sessi
    ticket from step 1 in the login's `ticket:` field, and set the credential and
    `unlock_password` env vars.
 
-3. **Start the daemon** (`chaz`) and leave it running — the bridge can only
+3. **Start the executor** (`chaz daemon`) and leave it running — the bridge can only
    bootstrap access against a reachable daemon.
 
 4. **Start the bridge:**
@@ -436,8 +456,9 @@ Matrix add them yourself), or reply `!chaz approve` / `!chaz deny` to resolve th
 oldest pending prompt in that room. The decision travels back to the daemon over
 the synced session DB and the turn continues.
 
-This is **fail-closed**: if no one responds within 30 minutes, or the bridge is
-offline when the agent asks, the tool is **denied** — a bridge-exposed session
+This is **fail-closed**: if no decision reaches the executor before
+`approvals.timeout` (default 300 seconds), the request times out without approval — a
+bridge-exposed session
 never runs an approval-required tool unsupervised. Which tools ask in the first
 place is set by `auto_approved_tools` / `tool_policies.*.approval` on the daemon.
 

@@ -10,9 +10,9 @@
 
 ## Summary
 
-A transport bridge (`chaz-matrix`, `chaz-discord`) is **dumb**: it is a pure I/O
-translator between one transport account and a set of session databases. It
-**never runs an agent**. Its entire job is three verbs:
+With `execution: client`, the bridge carries session traffic but does not run the
+agent loop. Each configured login connects one transport account to one owning
+agent's sessions:
 
 1. **proxy inbound** — give core the authenticated source and platform facts;
    it writes either a waking `Message` or a context-only `BridgeEvent`;
@@ -21,11 +21,13 @@ translator between one transport account and a set of session databases. It
 3. **relay approvals** — render a tool-approval prompt the daemon raised, and
    write the human's decision back.
 
-The **daemon** is a separate eidetica peer that owns the agents. It watches the
+In the direct-owner layout below, the **daemon** is a separate Eidetica peer that
+runs the agents. It watches the
 sessions a bridge exposes, runs the ReAct loop on them, and writes replies (and
 approval requests) back into the session DB. The two processes share nothing but
 synced eidetica databases — there is no RPC, no shared memory, no in-process
-callback between them.
+callback between them. In the service layout both processes instead open the same
+databases through the Eidetica daemon.
 
 ```mermaid
 graph LR
@@ -58,12 +60,11 @@ but the bridge still called `Server::new` with the agent-running loop enabled �
 so a bridge _answered its own messages_. That defeated the point: two peers could
 both run the same agent against the same session and fork it.
 
-The fix is a hard rule: **exactly one peer runs the agent for a given session.**
-The daemon is that peer. A bridge sets `BuildOptions::run_agent_loop = false`,
-which suppresses the `processing_loop` spawn in `Server::new`; the daemon sets it
-`true`. Everything else about a bridge's embedded `Server` (the session registry,
-the reconcile helpers, command dispatch) stays — it just never _executes_ an
-agent.
+The bridge binaries build a server with `BuildOptions::local`. The configured
+execution role, not the executable name, determines whether the agent loop runs. Use
+`execution: client` for a transport-only bridge and run the session's executor
+separately. This distinction concerns the agent loop: the legacy Matrix commands
+`!chaz send` and `!chaz rename` can call a backend on the bridge itself.
 
 ## Where state lives
 
@@ -120,6 +121,9 @@ tickets.
 
 ## Inbound: message → session entry
 
+The sequence shows ordinary Discord text in the direct-owner layout. It does not
+describe a Matrix join or command.
+
 ```mermaid
 sequenceDiagram
     participant U as User (transport)
@@ -140,14 +144,24 @@ sequenceDiagram
     B->>U: deliver reply (reconciler)
 ```
 
-The bridge's inbound code (`handle_message` / the Matrix message handler) does no
-more than resolve-or-create the session, ensure the reconciler/approval watchers
-are installed, and append the `Message` entry. It then **stops**. It does not
-build context, call an LLM, or write a reply.
+Discord's `Handler::handle_message` filters bots, repeated IDs and disallowed users,
+handles commands, then charges the ordinary message quota. Guild and DM text take the
+same path: `get_or_create_channel_session` uses the login's owning agent and the
+Discord channel ID. `inbound_user_entry` becomes a session `Message`, not a
+context-only observation.
+
+Matrix's `backfill_joined_room` can bind an ordinary room **at join**, before anyone
+asks a question. The live handler routes workspace traffic and commands separately.
+For plain text it uses the room ID, not a thread ID: an eligible DM, structured
+mention or confirmed group participation can wake the agent. Otherwise it looks up an
+existing binding for an observation rather than creating one for that observation.
+`Session::add_bridge_input` records the input according to the binding and wake
+decision. The Lobby has no session; a ready workspace chat must resolve to its
+recorded session.
 
 Transport encryption terminates in the bridge. The Matrix bridge decrypts before its
 message handler runs, through matrix-sdk with a persistent per-login crypto store. It
-writes the same plaintext `Message` entry it writes for an unencrypted room, and it
+records accepted text as a waking message or observation just as for an unencrypted room, and it
 encrypts replies on the way out. Recipient policy follows MSC4153: keys go only to
 cross-signed devices. The bridge also requires cross-signed incoming senders. The session DB, peer sync, and model
 backend see plaintext either way. See [Encrypted Rooms](../user_guide/matrix.md#encrypted-rooms).
@@ -253,11 +267,8 @@ Two `EntryType`s carry the protocol, correlated by a `request_id` (a UUID):
 | `ApprovalRequest`  | daemon     | `ApprovalRequestPayload { request_id, tool_name, risk_level, arguments_display }`         |
 | `ApprovalDecision` | bridge     | `ApprovalDecisionPayload { request_id, decision }` (`approve` \| `deny` \| `approve_all`) |
 
-Both are **control entries**, handled like `ToolCall`/`ToolResult`: excluded from
-LLM context (the context builder allowlists only `Message`/`Directive`/`Summary`),
-excluded from bridge message delivery (the reconciler delivers only agent
-`Message` rows), and ignored by `process_session` (its `should_process` match falls
-through to `_ => false`) so an approval entry **never wakes an agent turn**. The
+Both are **control entries**. They do not enter model context, start a turn,
+or get sent by the reply reconciler. The approval watcher handles them instead. The
 builders, parsers, and scan helpers are transport-generic, in `chaz_core::bridge`
 (`approval_request_entry`, `approval_decision_entry`, `parse_approval_*`,
 `resolved_decisions`, `unrendered_approval_requests`).
@@ -377,7 +388,7 @@ ask in the first place (see [Security → Tool Approval](../user_guide/security.
 
 | Concern                          | Where                                                                                                          |
 | -------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Agent-loop gate                  | `BuildOptions::run_agent_loop` → `Server::new` (`server/mod.rs`)                                               |
+| Agent-loop gate                  | `BuildOptions::local` (`server/build.rs`) → `Server::new` (`server/mod.rs`)                                    |
 | Session registry / `exposed_on`  | `agent_db.rs` (`SessionRef`, `register_session_ref`, `expose_session_on`)                                      |
 | Transport bindings               | `session::transport` (`bind_transport`, `transport_bindings`)                                                  |
 | Channel→session lookup           | `session::transport` (`get_or_create_channel_session`, `find_channel_session`)                                 |

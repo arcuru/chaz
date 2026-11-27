@@ -35,7 +35,14 @@ Example with a shared room:
 
 ## Setup
 
-1. **Create a Matrix account** for the bot on any homeserver.
+The steps below use a direct Eidetica owner with a provisioned store. If the bridge
+shares the executor's service login instead, use the [service connection
+settings](bridges.md#connection-settings), omit `ticket:` and skip the share and
+approval steps.
+
+1. **Create a Matrix account** for the bot. The project's local transport fixture
+   uses Synapse; it does not establish that another homeserver supports the same
+   login, room versions or encrypted-device flows.
 
 2. **Share the owning agent from the daemon** and copy the ticket:
 
@@ -58,7 +65,7 @@ Example with a shared room:
        homeserver_url: https://matrix.example
        username: "@chaz:example"
        password: ${MATRIX_PASSWORD}
-       allow_list: "@you:example" # optional; falls back to a top-level allow_list
+       allow_list: "^@you:example$" # match one sender MXID
        # id: <stable-login-id>         # optional; defaults to the MXID
        # room_size_limit: 100          # optional per-login cap
        # workspace_manager: "@you:example" # optional; enables the personal workspace
@@ -70,9 +77,6 @@ Example with a shared room:
      connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
      login: { username: chaz-matrix, password: your-eidetica-password }
      sync: { iroh: true }
-   backends:
-     - name: openai
-       api_key: ${OPENAI_API_KEY}
    ```
 
    `execution:` and `eidetica:` are the connector settings every Chaz process
@@ -94,9 +98,12 @@ Example with a shared room:
    `/sharing approve <id>`) and restart the bridge — see
    [Transport Bridges → Setup](bridges.md#setup).
 
-The bot then logs in, accepts invites from allowed users, and starts responding.
+The bot checks the inviter and live senders against the effective `allow_list`
+regex. If neither sets one, nobody matches. An explicit `allow_list: ""`, by
+contrast, matches every sender except the bot itself. This
+filter is not a promise to exclude other authors from room history.
 
-On joining a room, the bridge creates or reuses its session and imports only
+On joining an ordinary room, the bridge creates or reuses its session and imports only
 messages before the bot's join as context; that history never triggers an agent
 turn. On rejoin it imports only messages from the time the bot was away.
 `!chaz clear` stops the historical import at that marker. Restarting or
@@ -128,12 +135,9 @@ The bridge logs `Access was pre-authorized` and comes straight up.
 
 Two things worth knowing:
 
-- **Strip `&pr=iroh:` hints from the ticket when the two processes share a
-  host.** The daemon mints a fresh iroh endpoint on every restart and nothing
-  revises what was already recorded, so a pasted iroh address outlives the run
-  that published it. Sync tries every recorded address, and each dead one costs
-  a full timeout on every pass. A `pr=http:` hint pointing at the daemon's
-  `eidetica.sync.http_listen` is what actually connects host-local.
+- The loopback HTTP fixture drops stale iroh hints **when using a
+  loopback HTTP address** in the ticket. Keep a reachable address for the
+  transport you configured; the iroh-only example above needs its iroh hint.
 - **`/agent share` also writes the ticket to `$XDG_CONFIG_HOME/chaz/shares/`.**
   Point `XDG_CONFIG_HOME` somewhere disposable if you do not want that.
 
@@ -271,16 +275,23 @@ Safety notes:
 
 ## Message Handling
 
-- **DMs**: The bot responds to every message
-- **Group rooms**: By default, the bot responds to `!chaz` commands or messages that mention it. An explicitly enabled room can invite participation on every eligible text message.
+1. In a joined direct chat, send `Summarize the discussion so far` as ordinary text
+   from an allowed account. The bridge treats a room marked direct, or one reported
+   non-direct with at most two joined members, as a direct chat.
+2. In an ordinary group, use your client's mention picker to address the bot with the
+   same question. The event must mention the bot's user ID; typing its display name
+   is not enough. Without a mention, eligible text in an attached group is context
+   only unless [participation](#choosing-when-to-wake-in-a-group) is on. `!chaz`
+   starts a command, not a prompt with room context.
+3. Both messages use their **room's** session. A thread is not a session selector:
+   thread-per-session mode is unmerged, and the
+   [workspace](#personal-workspace-space-lobby-and-named-chats) offers named chat
+   rooms, not a threaded Inbox.
 
-To send a message with room context:
-
-```text
-!chaz summarize the discussion so far
-```
-
-To send without the `!chaz` prefix in a DM, just type normally.
+If an encrypted room stays silent, look for `Could not decrypt a message; it is
+ignored` in the bridge log. Check the sender device's cross-signature and room-key
+sharing before sending a **new** text; changing the prompt won't decrypt the old
+event. See [Encrypted Rooms](#encrypted-rooms).
 
 ## Commands
 
@@ -305,7 +316,7 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz sync <ticket>`            | Sync a remote session via ticket URL                                                         |
 | `!chaz compact`                  | Summarize and compact conversation history                                                   |
 | `!chaz context`                  | Context-window usage for this room's agent                                                   |
-| `!chaz print`                    | Print the current conversation context                                                       |
+| `!chaz print`                    | Show session history in the room, including messages from local clients                      |
 | `!chaz stop`                     | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
 
 ### Living Agents
@@ -335,9 +346,13 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | ------------------------------ | ----------------------------------------------------------------------------- |
 | `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭)    |
 | `!chaz send <msg>`             | One-shot message with no conversation context                                 |
-| `!chaz clear`                  | Ignore all messages before this point                                         |
+| `!chaz clear`                  | Mark the cutoff for room-history import; does not erase the session           |
 | `!chaz rename`                 | Rename the Matrix room based on conversation content (not in workspace chats) |
 | `!chaz party`                  | 🎉                                                                            |
+
+`!chaz send` and `!chaz rename` need a backend configured **on the bridge**.
+With the minimal config above they produce no model reply or generated room name.
+Ordinary chat uses the executor's backend instead.
 
 ### Workspace
 
@@ -392,7 +407,7 @@ reported rather than claiming detach succeeded.
 | `!chaz participation on`                   | Authorized, executor-confirmed ambient wake for this room; off by default                                    |
 | `!chaz participation off` / `status`       | Stop ambient wake / show confirmed state; messages remain observable                                         |
 | Normal final on a Matrix-origin turn       | Saved locally and queued to the same bound room under the owning agent's login                               |
-| Normal final on a TUI/local/schedule turn  | Saved locally only, even in a Matrix-bound session                                                           |
+| Normal final on a TUI/local/schedule turn  | Saved in the session; not automatically posted to the room                                                   |
 | `no_reply({})` in a Matrix-bound session   | Terminal action: no final message and no room post                                                           |
 | `matrix__send({"body":"text"})`            | Explicit/proactive room send; on a Matrix-origin turn it counts as the reply and the later final stays local |
 | `matrix__room_info({})`                    | Describe this turn's attached Matrix room using cached observations and report the agent's reply actions     |
@@ -570,7 +585,10 @@ Model, role, and backend selections live in the session's own eidetica database 
 
 ## Session Persistence
 
-Conversation history lives in per-session eidetica databases and survives bot restarts. The Matrix sync token is persisted by headjack, so the bot resumes from where it left off. Message batching prevents duplicate responses after a restart: messages received during the catch-up sync that were already processed are skipped.
+Conversation history lives in per-session eidetica databases and survives bot
+restarts. The bridge saves the Matrix SDK's next-batch token in the login's session
+file. It checks live text against event IDs already recorded in the session; pre-join
+history is not a new request.
 
 ## Retry Behavior
 

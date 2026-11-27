@@ -1,7 +1,7 @@
 # Discord Bot
 
 Chaz connects to Discord as a bot, responding in channels it can see. The
-Discord bridge runs as its own process and eidetica peer (`chaz-discord`),
+Discord bridge runs as its own process (`chaz-discord`),
 separate from the `chaz` daemon — read [Transport Bridges](bridges.md) first for
 the architecture and the one-time approval flow. This page covers
 Discord-specific configuration and behavior.
@@ -12,13 +12,17 @@ Discord-specific configuration and behavior.
    [Discord Developer Portal](https://discord.com/developers/applications), and
    copy the **bot token**.
 2. Under **Bot → Privileged Gateway Intents**, enable **Message Content
-   Intent** — the bridge requests it, and without it message bodies arrive
-   empty.
+   Intent**. The bridge requests this gateway intent to read channel text.
 3. Invite the bot to your server with the **Send Messages**, **Read Message
    History**, and **Add Reactions** permissions (reactions drive the
    approve/deny flow).
 
 ## Setup
+
+These steps use a direct Eidetica owner with a provisioned store. When sharing the
+executor's Eidetica service login, use the [service connection
+settings](bridges.md#connection-settings), omit `ticket:` and skip the share and
+approval steps.
 
 1. **Share the owning agent from the daemon** and copy the ticket:
 
@@ -47,9 +51,6 @@ Discord-specific configuration and behavior.
      connection: "sqlite:///var/lib/chaz-discord/eidetica.db"
      login: { username: chaz-discord, password: your-eidetica-password }
      sync: { iroh: true }
-   backends:
-     - name: openai
-       api_key: ${OPENAI_API_KEY}
    ```
 
    `bot_token` accepts a `${ENV}` reference or literal; when omitted it falls
@@ -57,6 +58,10 @@ Discord-specific configuration and behavior.
    of the file. `allowed_users` is an optional allow-list of Discord user ids —
    empty means everyone (the bot always ignores other bots and its own
    messages).
+
+   If two logins share a settings database, give each a distinct, stable
+   `login_id`. The default is `discord` for every entry, not the bot's account ID.
+   Reusing an ID overwrites the stored token and sender allow-list for that ID.
 
 3. **Run the bridge** (with the daemon already running):
 
@@ -70,25 +75,35 @@ Discord-specific configuration and behavior.
 
 ## Message Handling
 
-- **DMs**: the bot responds to every message from an allowed user.
-- **Server channels**: the bot responds to messages prefixed with `!chaz` or
-  that mention the bot.
-
-Each Discord channel is bound to its own session, fixed per channel (unlike
-Matrix, you don't rebind a channel to a different session from within Discord).
-The first message in a channel auto-creates the session.
+1. In a channel intended for the bot, send `What did we decide?` from an allowed
+   account. A DM works the same way. **No mention is required in a server channel.**
+   Keep the bot out of channels whose conversation should not reach the agent.
+   `allowed_users` filters senders, not destinations.
+2. The bridge finds or creates the owning agent's session for this login and channel
+   ID, installs reply delivery, and writes the message body. A second message in the
+   channel uses that session. `!chaz help` shows bridge commands instead of starting
+   a turn; some shared commands (such as `!chaz info`) also need a session and can
+   create it before the first chat message.
+3. Replies from the bound session appear in the channel. Unlike Matrix, Discord
+   delivers ordinary agent messages even if the turn began in a local client. Use a
+   separate session for private work.
 
 ## Rate limiting
 
-`message_limit` caps how many messages one Discord user may send the bot for
-the life of the bridge process; over the cap the bridge answers with an error
-and writes nothing to the session. `!chaz` commands are exempt. The limit is
-unset by default, and it is a per-process counter, not a per-hour rate — it
-exists to keep a chatty channel from growing the session DB without bound.
+`message_limit` is a top-level setting. Each login counts ordinary messages per
+Discord user until the bridge restarts. By default there is no cap.
 
-`room_size_limit` is Matrix-only: it counts joined room members, which has no
-Discord analogue worth the gateway calls. Use `allowed_users` to bound who can
-reach the bot in a large server.
+For example, with `message_limit: 2`, the user's third ordinary message gets:
+
+```text
+!chaz Error: you have used up your message limit of 2 messages.
+```
+
+Nothing is written to the session. Waiting an hour won't help; `!chaz help`
+still works because commands are exempt. If the cap was unintended, change the
+setting and restart the bridge. There is no need to replace the session.
+
+`room_size_limit` is Matrix-only.
 
 ## Commands
 
@@ -115,5 +130,5 @@ reactions (✅ approve · ❌ deny · ⏭ approve all) or by replying `!chaz app
 ## See also
 
 - [Transport Bridges](bridges.md) — architecture, config layout, approval flow
-- [Matrix Bot](matrix.md) — the full command reference (shared with Discord)
+- [Matrix Bot](matrix.md) — shared commands and Matrix-only room controls
 - [Sharing & Sync](session_sharing.md) — tickets and the `/sharing` queue
