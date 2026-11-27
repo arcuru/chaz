@@ -215,7 +215,7 @@ Attachment selects a bank to search; it does not lend the host's bank key to the
 /memory grant project-conventions chaz read
 ```
 
-The grant writes the bank's AuthSettings and a persistent `MemoryBankRef` into the Agent DB. Explicit `recall` uses this reference. On this version, attach the bank to the session for auto-recall; the legacy selector does not read new Table grants. An attachment alone creates no grant or reference. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
+The grant writes the bank's AuthSettings and a persistent `MemoryBankRef` into the Agent DB. Explicit `recall` and auto-recall both use this reference: a granted bank is auto-recalled in every session of that Agent without an attachment, until `/memory revoke` removes it. An attachment alone creates no grant or reference. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
 
 ### Auto-recall configuration
 

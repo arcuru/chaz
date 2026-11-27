@@ -75,6 +75,7 @@ pub struct ExecutorRef {
     pub db_id: String,
 }
 
+#[cfg(test)]
 const BLOB_KEY: &str = "value";
 
 /// Why a bound config read returned nothing. None of these fall back to the
@@ -1272,20 +1273,6 @@ impl AgentDb {
             .await?;
         let mut rows = store.search(|r: &SkillBankRef| r.name == name).await?;
         Ok(rows.pop().map(|(_, r)| r))
-    }
-}
-
-/// Legacy JSON read for the old memory-bank reference fallback.
-pub(crate) async fn read_blob<T>(database: &Database, store_name: &str) -> anyhow::Result<T>
-where
-    T: serde::de::DeserializeOwned + Default,
-{
-    let txn = database.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    match store.get_string(BLOB_KEY).await {
-        Ok(json) => Ok(serde_json::from_str(&json)?),
-        Err(e) if e.is_not_found() => Ok(T::default()),
-        Err(e) => Err(e.into()),
     }
 }
 
