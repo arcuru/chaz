@@ -1,140 +1,47 @@
 # Session Messaging Primitive
 
-> **Status: Historical design.** As of 2026-09-27, `spawn_agent` submits a local durable Agent job and immediately returns a session DB handle; `job_status`/`job_wait` observe it. The synchronous completion flow below is historical, not the current tool contract. See [Agent jobs](../architecture/sessions.md#agent-jobs-and-worker-children).
->
-> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). Request selection is durable reconciliation rather than a latest-entry check; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery). The `spawn_agent` sequence and completion signal below are historical.
+## Original proposal
 
-## Summary
+The original design proposed one invocation path: write a Message or Directive
+into a session and let the server's write callback start the Agent. At the time,
+`spawn_agent` called the runtime directly. Routing children through the server
+would give bridge messages and spawned requests the same session history.
 
-All agent invocation in chaz goes through a single mechanism: write an entry to a session database, and the server's callback-driven processing handles execution. Users, agents, schedulers, and system processes all invoke agents the same way.
+In the proposed synchronous flow, the tool registered a child runtime, wrote a
+Directive, waited on a completion channel, then read the child response back to
+the parent. **That is not the current `spawn_agent` contract.** Nor does the
+sequence describe Worker creation: for a recorded `spawn_worker` the Directive
+and parent link precede runtime installation.
 
-## Problem
+## Which path runs today?
 
-Originally, `spawn_agent` called `runtime::execute` directly, bypassing the server's callback infrastructure. This created two separate invocation paths with different behavior: bridge messages went through the server, but spawned child invocations did not. This made it impossible to unify features like audit trails, session sharing, and scheduled runs.
+| Source                | Request and execution                                                                                                                  | Result or observation                                                                                               |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Ordinary session turn | A processable Message or Directive is durable. A write wakes reconciliation; the executor records the attempt before running the turn. | Clients observe the attempt and its final entry in the session.                                                     |
+| `spawn_agent`         | One local Agent job with its own child DB. Publication precedes admission; submission does not wait for execution.                     | A child DB handle. `job_status` or `job_wait` observes the job.                                                     |
+| `spawn_worker`        | A child Directive under the calling Agent's Worker template. The Worker runtime is installed for that child.                           | Its reply or error by default; with `async: true`, a session handle for same-invocation `worker_wait` if available. |
+| Agent-owned schedule  | `Server::fire_agent_schedule` runs the wake prompt as invocation-scoped input, without inserting it as a Directive.                    | The Agent DB records the fire on a best-effort basis; observers do not receive the wake prompt as session history.  |
 
-## Design Goals
+The callback is a wake-up, not a receipt or an authorization check. Two writes
+can arrive before the executor runs. It selects the queued request from the
+persisted session state, not just the latest entry. Shared-session Agent
+messages follow [mention-gated turns](autonomous_agents.md), not a rule that
+all Agent messages invoke every participant.
 
-1. **Single invocation path**: All agent execution goes through `Server::process_session`
-2. **Rich entry types**: Sessions record not just chat messages but also directives, tool calls, and acknowledgments
-3. **Observable**: Completed ReAct model messages and tool results are durable in the session database for debugging and audit
-4. **Extensible**: New invocation sources (scheduler, inter-agent messages) use the same mechanism
+For a session turn with a durable attempt, the model response containing tool
+calls commits before the tools execute. The parent records each settled tool
+result before its next model request. The `ToolCall` and `ToolResult` entries
+are for display; the native transcript pairs calls with the results passed to
+the loop, after filtering and size limits. Neither a display entry nor a
+write callback is evidence that an interrupted call can safely run again.
 
-## Entry Types
+A standalone schedule fire has no parent turn attempt. It can write tool audit
+entries and a reply to its target session. For `spawn_worker` it also records
+the call positions and IDs needed to link the child, without storing a
+replayable parent exchange. A later interactive turn does not inherit the
+schedule's Worker results as paired tool calls.
 
-```mermaid
-graph LR
-    subgraph "LLM Context"
-        M[Message]
-        D[Directive]
-    end
-    subgraph "Audit Trail"
-        TC[ToolCall]
-        TR[ToolResult]
-    end
-    subgraph "Status"
-        A[Ack]
-        E[Error]
-    end
-```
-
-| Type               | In LLM Context | Source                  | Purpose                            |
-| ------------------ | :------------: | ----------------------- | ---------------------------------- |
-| `Message`          |      Yes       | Users, agents           | Chat messages                      |
-| `Directive`        |      Yes       | spawn_agent, scheduler  | Task instructions to an agent      |
-| `ToolCall`         |       No       | Runtime event sink      | Audit: tool was invoked            |
-| `ToolResult`       |       No       | Runtime event sink      | Audit: tool returned               |
-| `Ack`              |       No       | Server                  | Status: agent is processing        |
-| `Error`            |       No       | Server                  | Status: agent encountered an error |
-| `Summary`          |    Boundary    | /compact                | Context start boundary             |
-| `ApprovalRequest`  |       No       | Approval proxy (daemon) | Control: tool approval requested   |
-| `ApprovalDecision` |       No       | Bridge                  | Control: human's approval decision |
-| `Cancel`           |       No       | User frontend           | Control: stop one running attempt  |
-
-`Directive` entries are included in the LLM context as `user` role messages. This is because they are instructions to the agent, functionally equivalent to a user message.
-
-`Cancel` targets the active request and attempt IDs without entering context or waking another turn.
-The owning executor observes it even while model, approval, or tool work is waiting; see [ReAct Runtime → Cancellation](../architecture/react.md#cancellation).
-
-## Server Processing Logic
-
-The server reconciles durable requests rather than deciding from only the
-latest entry. A non-agent `Message` and a `Directive` are processable requests;
-agent-authored messages use the mention path described in [Autonomous Agents in
-Shared Sessions](./autonomous_agents.md). The executor selects the next queued
-request, records an attempt before model or tool work, and commits completion
-with its final entry. See [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
-
-```text
-next request in session order {
-    non-agent Message => start an attempt, then spawn agent task
-    Directive         => start an attempt, then spawn agent task
-    completed or interrupted request => do not run automatically
-}
-```
-
-This prevents the server from re-triggering on its own agent responses while allowing it to process directives from any source.
-
-## spawn_agent Flow
-
-```mermaid
-sequenceDiagram
-    participant P as Parent Agent
-    participant SA as SpawnAgent Tool
-    participant SV as Server
-    participant CS as Child Session
-    participant CA as Child Agent
-
-    P->>SA: execute("researcher", "find papers")
-    SA->>SV: register_child_session(agent, backend, tools, depth)
-    SV-->>SA: (conversation_id, session_db, completion_rx)
-    SA->>CS: write Directive entry
-    CS-->>SV: on_write callback
-    SV->>CA: spawn agent task
-    CA->>CS: write Ack
-    CA->>CS: commit model/tool transcript records and display entries
-    CA->>CS: commit terminal model record, Message, and completion
-    CA-->>SA: completion_tx.send(())
-    SA->>CS: read the completed request response
-    SA-->>P: return response
-```
-
-### OnceLock for Circular Dependency
-
-`SpawnAgent` is registered in the `ToolRegistry` before `Server` exists (the server needs the registry). The circular dependency is resolved with `Arc<OnceLock<Arc<Server>>>`:
-
-1. Create the `OnceLock` and pass it to `SpawnAgent`
-2. Register `SpawnAgent` in the `ToolRegistry`
-3. Create `Server` with the `ToolRegistry`
-4. Set the `OnceLock` with the `Server`
-
-### SpawnContext
-
-Spawn-specific metadata is bundled in `SpawnContext`:
-
-- `call_depth` — current nesting level (incremented per spawn)
-- `max_call_depth` — from agent definition
-- `parent_tools` — the parent's `ScopedTools` for transitive narrowing
-- `completion_tx` — signals the parent when the child finishes
-
-## Runtime persistence
-
-Executor-backed turns use an awaited recorder rather than a concurrent best-effort event writer. A model response carrying tool calls commits before execution, and its full correlated result commits before the next model call. Display entries are projections of those successful commits and may truncate results; the structured transcript does not.
-
-Standalone scheduled turns keep a compatibility `mpsc::Sender<RuntimeEvent>` adapter because that path has no durable request attempt:
-
-```text
-enum RuntimeEvent {
-    ToolCall { id, name, arguments }
-    ToolResult { id, name, output, is_error }
-}
-```
-
-These scheduled audit writes remain outside the turn-attempt recovery protocol.
-
-## Future: Scheduled Runs
-
-Scheduled runs are a direct consumer of this primitive. A scheduler background task holds cron state and periodically writes `Directive` entries into sessions. The server's existing callback machinery handles the rest -- no new invocation path needed.
-
-## Future: Inter-Agent Communication
-
-Agents can communicate by writing entries to shared sessions. The session messaging primitive makes this natural: any participant can write a `Directive` or `Message` to any session they have access to.
+See [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery),
+[Agent jobs](../architecture/sessions.md#agent-jobs-and-worker-children),
+[Inspecting Worker Sessions](worker_sessions.md) and
+[Agent-Owned Schedules](agent_schedules.md) for the respective lifecycles.
