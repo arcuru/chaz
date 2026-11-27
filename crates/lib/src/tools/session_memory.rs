@@ -2,7 +2,10 @@
 //! peer's cached session handle or accepts a key/identity from the model.
 use crate::agent_db::{MemoryEntry, SESSIONS_STORE, SessionRef};
 use crate::hosted_index::DbEntry;
-use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
+use crate::session::history::legacy_order_key;
+use crate::session::{
+    EntryType, Session, SessionEntry, SessionRegistry, read_session_name_from_db,
+};
 use crate::tool::{
     ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
 };
@@ -12,7 +15,7 @@ use eidetica::store::{Table, TableCursor};
 use eidetica::{Database, Snapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -20,6 +23,9 @@ use uuid::Uuid;
 
 const PAGE: usize = 8;
 const EXCERPT_BYTES: usize = 768;
+const SCAN_PAGE: usize = 128;
+const SCAN_PAGES_PER_CALL: usize = 4;
+const ORDERED_WINDOW: usize = 64;
 
 fn prefix(text: &str, bytes: usize) -> &str {
     &text[..text.floor_char_boundary(bytes.min(text.len()))]
@@ -64,7 +70,98 @@ struct Bookmark {
     actor: DbEntry,
     root: eidetica::entry::ID,
     snapshot: Snapshot,
-    cursor: TableCursor,
+    cursor: BrowseCursor,
+}
+
+#[derive(Clone)]
+enum BrowseCursor {
+    Registry(TableCursor),
+    Excerpts(ExcerptCursor),
+}
+
+type OrderKey = (chrono::DateTime<chrono::Utc>, String);
+
+#[derive(Clone)]
+enum ExcerptCursor {
+    Scan {
+        after: Option<OrderKey>,
+        next: Option<TableCursor>,
+        keys: BTreeSet<OrderKey>,
+    },
+    Emit {
+        keys: BTreeSet<OrderKey>,
+        more: bool,
+    },
+}
+
+impl ExcerptCursor {
+    fn start(after: Option<OrderKey>) -> Self {
+        Self::Scan {
+            after,
+            next: None,
+            keys: BTreeSet::new(),
+        }
+    }
+
+    async fn read(self, table: &Table<SessionEntry>) -> Result<(Vec<Value>, Option<Self>)> {
+        // Legacy keys don't encode the canonical order. Scan a bounded chunk
+        // per call and keep only the next window of ordered keys at this
+        // snapshot. Never retain transcript bodies or a DB handle in cursors.
+        let (mut keys, more) = match self {
+            Self::Emit { keys, more } => (keys, more),
+            Self::Scan {
+                after,
+                mut next,
+                mut keys,
+            } => {
+                for _ in 0..SCAN_PAGES_PER_CALL {
+                    let page = table.scan_page(next.as_ref(), SCAN_PAGE).await?;
+                    for (id, entry) in page.rows {
+                        if entry.entry_type == EntryType::Message && valid_id(&id) {
+                            let (timestamp, _) = legacy_order_key(&id, &entry);
+                            let key = (timestamp, id);
+                            if after.as_ref().is_none_or(|after| &key > after) {
+                                keys.insert(key);
+                                if keys.len() > ORDERED_WINDOW + 1 {
+                                    keys.pop_last();
+                                }
+                            }
+                        }
+                    }
+                    next = page.next;
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                if next.is_some() {
+                    return Ok((Vec::new(), Some(Self::Scan { after, next, keys })));
+                }
+                let more = keys.len() > ORDERED_WINDOW;
+                if more {
+                    keys.pop_last();
+                }
+                (keys, more)
+            }
+        };
+        let mut rows = Vec::new();
+        let mut last = None;
+        for _ in 0..PAGE {
+            let Some(key) = keys.pop_first() else { break };
+            let id = &key.1;
+            let row = table.get(id).await?;
+            let row = excerpt(id, &row).ok_or_else(|| anyhow::anyhow!("not a chat message"))?;
+            rows.push(serde_json::to_value(row)?);
+            last = Some(key);
+        }
+        let next = if !keys.is_empty() {
+            Some(Self::Emit { keys, more })
+        } else if more {
+            Some(Self::start(last))
+        } else {
+            None
+        };
+        Ok((rows, next))
+    }
 }
 
 pub(crate) struct BrowseSessions {
@@ -134,37 +231,55 @@ impl BrowseSessions {
         };
         let txn = db.new_transaction_at(&snapshot).await?;
         let (mut result, next) = if args.session_db_id.is_some() {
-            let page = txn
-                .get_store::<Table<SessionEntry>>("entries")
-                .await?
-                .scan_page(cursor.as_ref(), PAGE)
-                .await?;
-            let rows: Vec<_> = page
-                .rows
-                .iter()
-                .filter_map(|(id, row)| excerpt(id, row))
-                .collect();
+            let cursor = match cursor {
+                Some(BrowseCursor::Excerpts(cursor)) => cursor,
+                None => ExcerptCursor::start(None),
+                _ => anyhow::bail!("cursor unavailable"),
+            };
+            let table = txn.get_store::<Table<SessionEntry>>("entries").await?;
+            let (rows, next) = cursor.read(&table).await?;
             (
                 json!({"session_db_id": db.root_id().to_string(), "untrusted_message_excerpts": rows}),
-                page.next,
+                next.map(BrowseCursor::Excerpts),
             )
         } else {
+            let cursor = match cursor {
+                Some(BrowseCursor::Registry(cursor)) => Some(cursor),
+                None => None,
+                _ => anyhow::bail!("cursor unavailable"),
+            };
             let page = txn
                 .get_store::<Table<SessionRef>>(SESSIONS_STORE)
                 .await?
                 .scan_page(cursor.as_ref(), PAGE)
                 .await?;
             let mut ids = Vec::new();
+            let mut names = serde_json::Map::new();
             for (_, candidate) in page.rows {
                 if let Ok(session) = self
                     .registry
                     .open_index_source(actor, &candidate.session_db_id)
                     .await
                 {
-                    ids.push(session.root_id().to_string());
+                    // Never join the host catalog or project the full meta
+                    // document. A failed label read needn't hide a readable ID.
+                    let name = read_session_name_from_db(&session).await.ok().flatten();
+                    if SessionRegistry::check_index_grant(&session, &actor.pubkey, Permission::Read)
+                        .await
+                        .is_ok()
+                    {
+                        let id = session.root_id().to_string();
+                        if let Some(name) = name {
+                            names.insert(id.clone(), json!(prefix(&name, 128)));
+                        }
+                        ids.push(id);
+                    }
                 }
             }
-            (json!({"sessions": ids}), page.next)
+            (
+                json!({"sessions": ids, "untrusted_session_names": names}),
+                page.next.map(BrowseCursor::Registry),
+            )
         };
         SessionRegistry::check_index_grant(&db, &actor.pubkey, Permission::Read).await?;
         SessionRegistry::check_index_membership(&here, actor).await?;
@@ -269,7 +384,7 @@ impl Tool for BrowseSessions {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "browse_sessions".into(),
-            description: "List readable sessions registered to this Agent, or page untrusted chat excerpts from one readable session. Results are recorded in this conversation. Use next_cursor even after empty pages; null means end.".into(),
+            description: "List this Agent's readable sessions with untrusted names, or page through one session's untrusted chat excerpts in conversation order. Results are recorded in this conversation. Use next_cursor even after empty pages; null means end.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {"session_db_id": {"type": "string"}, "cursor": {"type": "string"}},
