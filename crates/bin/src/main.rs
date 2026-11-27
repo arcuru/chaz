@@ -447,7 +447,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             return Ok(());
         }
-        instance::wait_for_shutdown().await;
+        let _ = instance::wait_for_shutdown().await;
         info!("Shutdown signal received; stopping");
         Ok(())
     } else if let Some(a) = cmd_args {

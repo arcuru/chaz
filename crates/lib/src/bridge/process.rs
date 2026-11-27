@@ -20,7 +20,9 @@ use tracing::{info, warn};
 use crate::agent_db::LoginRef;
 use crate::bridge_identity::{BridgeIdentity, SyncBootstrap, establish_login};
 use crate::config::Config;
-use crate::instance::{self, ConnectedInstance, InstanceOwnership, ServiceGeneration};
+use crate::instance::{
+    self, CleanupCause, ConnectedInstance, InstanceOwnership, ServiceGeneration,
+};
 use crate::server::{BuiltServer, Server};
 use crate::session::BootstrapOutcome;
 
@@ -340,7 +342,7 @@ impl ServiceGeneration for BridgeGeneration {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), String> {
+    async fn shutdown(&mut self, cause: CleanupCause) -> Result<(), String> {
         self.shutdown.notify_waiters();
         while let Some(task) = self.tasks.last_mut() {
             if tokio::time::timeout(TRANSPORT_SHUTDOWN_GRACE, &mut *task)
@@ -352,7 +354,7 @@ impl ServiceGeneration for BridgeGeneration {
             }
             self.tasks.pop();
         }
-        self.built.try_shutdown().await
+        self.built.try_shutdown_with_cause(cause).await
     }
 }
 
@@ -367,7 +369,7 @@ pub async fn run_direct(mut generation: BridgeGeneration) -> anyhow::Result<()> 
         }
         result = generation.finished() => result,
     };
-    generation.shutdown_complete().await;
+    generation.shutdown_complete(CleanupCause::Explicit).await;
     result
 }
 

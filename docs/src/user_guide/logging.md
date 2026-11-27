@@ -55,6 +55,40 @@ The zero execution-phase timings do not mean the whole launch is instant.
 If the registry phase dominates, inspect its group/peer database timings
 rather than disabling command providers or changing executor credentials.
 
+## Service shutdown phases
+
+At `info` level, compare these events from the same process invocation:
+
+| Event                              | Fields                                                                          |
+| ---------------------------------- | ------------------------------------------------------------------------------- |
+| `Service shutdown signal accepted` | `signal`: `sigterm` or `ctrl_c`; `phase`: `steady_state` or `reconnect_backoff` |
+| `Registered-session cleanup begin` | `cause`                                                                         |
+| `Registered-session cleanup end`   | `cause`, `elapsed_ms`                                                           |
+
+`cause` is `terminal_shutdown` when the supervisor selects a signal during
+steady state, `shutdown_listener_ended` when that wait ends without a signal,
+`generation_replacement` before reconnect, `generation_finished` when the
+generation exits on its own, or `service_probe_failed` after a non-retryable
+probe failure. Cleanup requested outside the service supervisor uses `explicit`.
+
+1. For a normal steady-state stop, expect the signal event followed by both
+   cleanup events, for example (timestamps and log targets omitted):
+
+   ```text
+   Service shutdown signal accepted signal="sigterm" phase="steady_state"
+   Registered-session cleanup begin cause="terminal_shutdown"
+   Registered-session cleanup end cause="terminal_shutdown" elapsed_ms=3
+   ```
+
+2. If the begin event appears but the end does not, check for the end later in
+   the same invocation. The begin event shows that session cleanup started;
+   the end event covers only that phase, not process exit. Retries can repeat
+   the pair.
+3. When a signal is accepted during reconnect backoff, the old generation's
+   cleanup has already run with `cause="generation_replacement"`. No new
+   terminal cleanup pair is expected. A missing signal event alone does not
+   establish whether the process received the signal.
+
 ## Controlling Verbosity
 
 Set the `RUST_LOG` environment variable:
