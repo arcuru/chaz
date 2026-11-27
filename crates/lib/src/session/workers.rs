@@ -176,7 +176,6 @@ mod tests {
             .await
             .unwrap();
         let mut changes = observer.catalog_changes();
-        let mut resident_events = observer.subscribe_new_sessions().await.unwrap();
         let (id, child) = writer
             .create_child_session(&parent_id.0, Some("spawn:positive"))
             .await
@@ -187,9 +186,16 @@ mod tests {
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if resident_events.recv().await.unwrap().session_db_id == id.0 {
+                if observer
+                    .resident_session_rows()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.session_db_id == id.0)
+                {
                     break;
                 }
+                changes.changed().await.unwrap();
             }
         })
         .await

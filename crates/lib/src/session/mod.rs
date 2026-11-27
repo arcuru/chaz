@@ -935,6 +935,7 @@ impl Session {
 
     /// Load entries from eidetica
     async fn load_from_db(&mut self) {
+        tracing::debug!(session_db_id = %self.database.root_id(), "Loading session transcript");
         let Ok(txn) = self.database.new_transaction().await else {
             return;
         };
@@ -1180,7 +1181,16 @@ impl Session {
     /// together. An entry from a concurrent branch is not in the baseline and
     /// remains queued after the branches merge.
     pub async fn ensure_turn_schema_baseline(&self) -> anyhow::Result<()> {
-        let txn = Self::legacy_history_transaction(&self.database).await?;
+        Self::ensure_turn_schema_baseline_from(&self.database, None).await
+    }
+
+    /// A lazy executor baselines the historical frontier it first observed,
+    /// not the newer rows that caused it to wake up.
+    pub(crate) async fn ensure_turn_schema_baseline_from(
+        database: &Database,
+        legacy: Option<&Snapshot>,
+    ) -> anyhow::Result<()> {
+        let txn = Self::legacy_history_transaction(database).await?;
         let meta = txn.get_store::<DocStore>(META_STORE).await?;
         if meta
             .get_string(TURN_SCHEMA_KEY)
@@ -1189,8 +1199,15 @@ impl Session {
         {
             return Ok(());
         }
-        let rows = txn
-            .get_store::<Table<SessionEntry>>(&self.store_name)
+        let historical;
+        let baseline_txn = if let Some(legacy) = legacy {
+            historical = database.new_transaction_at(legacy).await?;
+            &historical
+        } else {
+            &txn
+        };
+        let rows = baseline_txn
+            .get_store::<Table<SessionEntry>>("entries")
             .await?
             .search(|_| true)
             .await?;
@@ -1201,6 +1218,101 @@ impl Session {
             .await?;
         txn.commit().await?;
         Ok(())
+    }
+
+    /// Read only. A result without work is usable only for this exact
+    /// frontier and Agent roster. An unreadable view is never proof of idle.
+    pub(crate) async fn resident_work_at(
+        database: &Database,
+        at: &Snapshot,
+        prior_legacy: Option<&Snapshot>,
+        live_write: bool,
+        is_agent: impl Fn(&str) -> bool,
+    ) -> anyhow::Result<(bool, Option<Snapshot>)> {
+        let read = Self::history_at(database, at).await?;
+        read.require_legacy()?;
+        let txn = database.new_transaction_at(at).await?;
+        let meta = txn.get_store::<DocStore>(META_STORE).await?;
+        let legacy = match meta.get_string(TURN_SCHEMA_KEY).await {
+            Ok(version) if version == TURN_SCHEMA_VERSION => None,
+            Ok(version) => anyhow::bail!("unsupported turn schema {version}"),
+            Err(err) if err.is_not_found() => Some(prior_legacy.unwrap_or(at).clone()),
+            Err(err) => return Err(err.into()),
+        };
+        let (entry_ids, entries) = history::entry_rows(&txn, "entries")
+            .await?
+            .into_iter()
+            .unzip();
+        let session = Self {
+            conversation_id: ConversationId(database.root_id().to_string()),
+            database: database.clone(),
+            signing_key: None,
+            entries,
+            entry_ids,
+            store_name: "entries".into(),
+        };
+        let baseline: HashSet<String> = match &legacy {
+            Some(legacy) if legacy == at => {
+                session.entry_ids.iter().map(ToString::to_string).collect()
+            }
+            Some(legacy) => {
+                history::entry_rows(&database.new_transaction_at(legacy).await?, "entries")
+                    .await?
+                    .into_iter()
+                    .map(|(id, _)| id.to_string())
+                    .collect()
+            }
+            None => serde_json::from_str(&meta.get_string(TURN_BASELINE_KEY).await?)?,
+        };
+        let live = HashSet::new();
+        let attempts = session.read_turn_attempts_at(at).await?;
+        let states = index_attempt_states(attempts, &live);
+        let mentioned = session.latest_entry_with_id().and_then(|(id, entry)| {
+            // A mention in historical agent output is not a durable request.
+            (live_write
+                && matches!(entry.entry_type, EntryType::Message)
+                && is_agent(&entry.sender)
+                && !baseline.contains(id.as_str())
+                && !states.contains_key(id))
+            .then(|| {
+                parse_mentions(&entry.content)
+                    .into_iter()
+                    .filter(|name| !name.eq_ignore_ascii_case(&entry.sender))
+                    .collect::<Vec<_>>()
+            })
+        });
+        let maybe_mention = if let Some(mentioned) = mentioned.filter(|names| !names.is_empty()) {
+            try_read_meta_at(database, at)
+                .await?
+                .agents
+                .iter()
+                .any(|agent| {
+                    is_agent(&agent.display_name)
+                        && mentioned
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&agent.display_name))
+                })
+        } else {
+            false
+        };
+        let mut interrupted = HashSet::new();
+        for request in session.turn_requests_with_states(is_agent, states, baseline)? {
+            match request.state {
+                TurnRequestState::Queued => return Ok((true, legacy)),
+                TurnRequestState::Interrupted { attempt_id } => {
+                    interrupted.insert(attempt_id);
+                }
+                _ => {}
+            }
+        }
+        let actionable = maybe_mention
+            || session
+                .command_requests_at(at, &live)
+                .await?
+                .into_iter()
+                .any(|request| request.state == TurnRequestState::Queued)
+            || Self::has_job_wait_checkpoint_in(&txn, &interrupted).await?;
+        Ok((actionable, legacy))
     }
 
     /// Reconcile durable turn requests in session order.
@@ -3100,6 +3212,89 @@ mod tests {
                 .map(|request| request.id.to_string())
                 .collect()
         );
+    }
+
+    #[tokio::test]
+    async fn resident_initial_frontier_does_not_replay_an_agent_mention() {
+        let (_instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let mut session = Session::new(ConversationId("room".into()), db.clone()).await;
+        session
+            .update_meta(|meta| {
+                meta.agents.push(AgentRef {
+                    db_id: "beta-db".into(),
+                    display_name: "beta".into(),
+                    home_pubkey: None,
+                });
+            })
+            .await
+            .unwrap();
+        session
+            .add_entry(SessionEntry {
+                content: "Would @beta check this?".into(),
+                ..entry_at("alpha", 1, None)
+            })
+            .await
+            .unwrap();
+        let at = db.snapshot().await.unwrap();
+        let is_agent = |name: &str| matches!(name, "alpha" | "beta");
+        assert!(
+            !Session::resident_work_at(&db, &at, None, false, is_agent)
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            Session::resident_work_at(&db, &at, None, true, is_agent)
+                .await
+                .unwrap()
+                .0
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_legacy_cutoff_does_not_write_or_absorb_a_later_prompt() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut session = Session::new(ConversationId("legacy".into()), db.clone()).await;
+        session.add_entry(entry_at("user", 1, None)).await.unwrap();
+        session
+            .add_entry(entry_at("retired-agent", 2, None))
+            .await
+            .unwrap();
+        let initial = db.snapshot().await.unwrap();
+
+        let (work, cutoff) = Session::resident_work_at(&db, &initial, None, false, |_| false)
+            .await
+            .unwrap();
+        assert!(!work);
+        assert_eq!(cutoff.as_ref(), Some(&initial));
+        assert_eq!(db.snapshot().await.unwrap(), initial);
+
+        let prompt = session.add_entry(entry_at("user", 3, None)).await.unwrap();
+        session
+            .add_entry(SessionEntry {
+                entry_type: EntryType::Summary,
+                ..entry_at("retired-agent", 4, None)
+            })
+            .await
+            .unwrap();
+        let changed = db.snapshot().await.unwrap();
+        let (work, cutoff) =
+            Session::resident_work_at(&db, &changed, cutoff.as_ref(), false, |_| false)
+                .await
+                .unwrap();
+        assert!(work);
+        assert_eq!(db.snapshot().await.unwrap(), changed);
+        Session::ensure_turn_schema_baseline_from(&db, cutoff.as_ref())
+            .await
+            .unwrap();
+        let requests = session
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, prompt);
+        assert_eq!(requests[0].state, TurnRequestState::Queued);
     }
 
     #[tokio::test]

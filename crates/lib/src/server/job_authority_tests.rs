@@ -408,7 +408,10 @@ async fn job_authority_holds_cached_and_restart_acceptance_until_readable() {
                     .find(|row| row.session_db_id == id)
                     .unwrap();
                 assert!(
-                    !fresh.adopt_local_client_session(row.clone()).await,
+                    !fresh
+                        .adopt_indexed_job(&row.session_db_id)
+                        .await
+                        .unwrap_or(false),
                     "a hold must remain eligible for retry"
                 );
                 fixture
@@ -449,7 +452,7 @@ async fn job_authority_holds_cached_and_restart_acceptance_until_readable() {
                         .contains("accepted job authority differs from parent")
                 );
                 fixture.payload(0, Healthy).await;
-                assert!(fresh.adopt_local_client_session(row).await);
+                assert!(fresh.adopt_indexed_job(&row.session_db_id).await.unwrap());
                 assert_eq!(
                     fresh.validate_accepted_job(&child).await.unwrap(),
                     Some(accepted.clone())
