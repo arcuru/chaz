@@ -17,7 +17,7 @@ use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::roots::{self, RootSetup};
@@ -25,13 +25,6 @@ use super::{
     BridgeKind, SessionCatalogEntry, SessionIndex, SessionStatus, read_meta_from_db,
     update_meta_on_db,
 };
-
-/// Notification emitted when a new session is indexed in the registry.
-#[derive(Debug, Clone)]
-pub struct NewSessionEvent {
-    pub session_db_id: String,
-    pub source: Option<String>,
-}
 
 /// Registry over chaz's two peer-local bookkeeping databases. Neither syncs;
 /// canonical sync-ful state lives in per-session, per-agent, and per-bank DBs.
@@ -60,8 +53,6 @@ pub struct SessionRegistry {
     /// Peer-runtime state DB (credentials, cron timestamps, schedule state).
     pub(super) chaz_peer: Database,
     pub agents: Arc<AgentRegistry>,
-    pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
-    new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
     /// Serialize local explicit renames with extension fill-if-unnamed writes.
     name_lock: Mutex<()>,
     /// Coalesced read-side invalidation, independent of the resident's single
@@ -91,6 +82,10 @@ pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// per-session metadata as a versioned, atomic Doc.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 const CATALOG_VERSION: i64 = 1;
+
+fn local_resident_source(source: &str) -> bool {
+    !source.starts_with("spawn:") && !source.starts_with("job-stage:")
+}
 
 impl SessionCatalogEntry {
     fn to_native(&self) -> Doc {
@@ -263,36 +258,17 @@ impl SessionRegistry {
             chaz_peer = %chaz_peer.root_id(),
             "Session registry roots opened by reference"
         );
-        let (new_session_tx, new_session_rx) = mpsc::channel(64);
         let (catalog_changed, _) = tokio::sync::watch::channel(());
         let catalog_notify = catalog_changed.clone();
 
-        // Watch the chaz_group for writes (including remote sync).
-        // On each write, re-scan the sessions index and fire events for each known session.
-        // Consumers dedupe via their own `seen` set.
-        let sync_tx = new_session_tx.clone();
+        // Only consumers that need catalog rows read them. In particular, a
+        // targeted frontend doesn't scan routing metadata on initial delivery.
         let stage = Instant::now();
         chaz_group
-            .on_write(move |_, db| {
+            .on_write(move |_, _| {
+                tracing::trace!("Group catalog invalidated");
                 catalog_notify.send_replace(());
-                tracing::debug!("chaz_group write; rescanning the sessions index");
-                let sync_tx = sync_tx.clone();
-                let db = db.clone();
-                Box::pin(async move {
-                    if let Ok(txn) = db.new_transaction().await
-                        && let Ok(store) = txn.get_store::<DocStore>(STORE_SESSIONS).await
-                        && let Ok(doc) = store.get_all().await
-                    {
-                        for (key, value) in doc.iter() {
-                            let source: Option<String> = value.try_into().ok();
-                            let _ = sync_tx.try_send(NewSessionEvent {
-                                session_db_id: key.clone(),
-                                source,
-                            });
-                        }
-                    }
-                    Ok(())
-                })
+                std::future::ready(Ok(()))
             })
             .await?
             .detach();
@@ -308,8 +284,6 @@ impl SessionRegistry {
             chaz_group,
             chaz_peer,
             agents,
-            new_session_tx,
-            new_session_rx: Mutex::new(Some(new_session_rx)),
             name_lock: Mutex::new(()),
             catalog_changed,
             local_client_sessions: Mutex::new(std::collections::HashMap::new()),
@@ -331,12 +305,7 @@ impl SessionRegistry {
             .clone()
     }
 
-    /// Take the new-session event receiver. Can only be called once.
-    pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
-        self.new_session_rx.lock().await.take()
-    }
-
-    /// Subscribe without taking the resident executor's notification receiver.
+    /// Subscribe to coalesced catalog invalidation, not session-tree writes.
     pub fn catalog_changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.catalog_changed.subscribe()
     }
@@ -571,10 +540,6 @@ impl SessionRegistry {
             .lock()
             .await
             .insert(id.clone());
-        let _ = self.new_session_tx.try_send(NewSessionEvent {
-            session_db_id: id.clone(),
-            source: Some(source),
-        });
         Ok(ConversationId(id))
     }
 
@@ -634,11 +599,6 @@ impl SessionRegistry {
             source = ?source,
             "Created new session"
         );
-
-        let _ = self.new_session_tx.try_send(NewSessionEvent {
-            session_db_id: session_db_id.clone(),
-            source: source.map(|s| s.to_string()),
-        });
 
         Ok((conv_id, db))
     }
@@ -787,6 +747,7 @@ impl SessionRegistry {
         }
         let user = self.user.lock().await;
         let (mut db, key_id) = Self::bind_tracked_session(&user, &root_id).await?;
+        tracing::debug!(session_db_id, "Opened tracked session");
         // Single-hop delegated sessions share an inherited snapshot floor across
         // interactive turns, tools and pinned schedules. Refresh every keyed
         // embedded open, including read-only opens, without changing the selected key.
@@ -883,38 +844,103 @@ impl SessionRegistry {
         &self,
         session_db_id: &str,
     ) -> anyhow::Result<(ConversationId, Database)> {
-        let root_id = eidetica::entry::ID::parse(session_db_id)
-            .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let db = self
+            .bind_local_client_session(session_db_id)
+            .await?
+            .with_context(|| {
+                format!("Session {session_db_id} does not authorize the default key to write")
+            })?;
+        self.retain_local_client_session(session_db_id, &db).await;
+        Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    pub(crate) async fn bind_local_client_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<Option<Database>> {
+        let root_id = eidetica::entry::ID::parse(session_db_id)?;
         let user = self.user.lock().await;
         let default_key = user.get_default_key()?;
-        let (identity, permission) = Database::find_sigkeys(&self.instance, &root_id, &default_key)
-            .await?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Session {session_db_id} does not authorize this peer's default key"
-                )
-            })?;
-        if !permission.can_write() {
-            anyhow::bail!(
-                "Session {session_db_id} grants this peer's default key {permission:?}, which cannot run a turn"
-            );
-        }
         let signing_key = user.get_signing_key(&default_key)?;
+        drop(user);
+        let Some((identity, permission)) =
+            Database::find_sigkeys(&self.instance, &root_id, &default_key)
+                .await?
+                .into_iter()
+                .next()
+        else {
+            return Ok(None);
+        };
+        if !permission.can_write() {
+            return Ok(None);
+        }
         let db = Database::open(&self.instance, &root_id).await?.with_key(
             eidetica::database::DatabaseKey::with_identity(signing_key, identity),
         );
+        Ok(Some(db))
+    }
+
+    pub(crate) async fn retain_local_client_session(&self, session_db_id: &str, db: &Database) {
         self.local_client_sessions
             .lock()
             .await
             .insert(session_db_id.to_string(), db.clone());
-        Ok((ConversationId(session_db_id.to_string()), db))
     }
 
     // -------------------------------------------------------------------------
     // Session listing
     // -------------------------------------------------------------------------
+
+    /// Roots already classified by the peer routing index. No session opens.
+    pub(crate) async fn indexed_session_ids(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<eidetica::entry::ID>> {
+        let txn = self.chaz_group.new_transaction().await?;
+        let sessions = txn
+            .get_store::<DocStore>(STORE_SESSIONS)
+            .await?
+            .get_all()
+            .await?;
+        Ok(sessions
+            .iter()
+            .filter_map(|(id, _)| eidetica::entry::ID::parse(id).ok())
+            .collect())
+    }
+
+    /// Execution must not use the display-only fallback for a malformed row.
+    pub(crate) async fn resident_session_rows(&self) -> anyhow::Result<Vec<SessionIndex>> {
+        let txn = self.chaz_group.new_transaction().await?;
+        Self::list_sessions_in(&txn, false).await
+    }
+
+    /// Recheck only the candidate row before claiming. Its catalog entry may
+    /// have been closed or changed while a watch was reading the session.
+    pub(crate) async fn local_resident_row_is_active(&self, id: &str) -> anyhow::Result<bool> {
+        let txn = self.chaz_group.new_transaction().await?;
+        let route = txn
+            .get_store::<DocStore>(STORE_SESSIONS)
+            .await?
+            .get_literal(id)
+            .await;
+        let source = match route {
+            Ok(Value::Text(source)) => source,
+            Ok(_) => return Ok(false),
+            Err(error) if error.is_not_found() => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let active = match catalog.get_literal(id).await {
+            Ok(value) => {
+                let row = SessionCatalogEntry::decode_stored(&value)?;
+                row.session_db_id == id
+                    && row.status == SessionStatus::Active
+                    && row.source.as_deref().is_none_or(local_resident_source)
+            }
+            Err(error) if error.is_not_found() => true,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(active && local_resident_source(&source))
+    }
 
     /// List every session known to the registry.
     ///
@@ -923,8 +949,9 @@ impl SessionRegistry {
     /// surface here with `created_at = None` and bridge derived from their
     /// routing-index source string.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionIndex>> {
+        tracing::debug!("Listing session catalog with aliases");
         let txn = self.chaz_group.new_transaction().await?;
-        Self::list_sessions_in(&txn).await
+        Self::list_sessions_in(&txn, true).await
     }
 
     /// Read routing, catalog and aliases from one delivered group frontier.
@@ -932,16 +959,25 @@ impl SessionRegistry {
         &self,
         at: &eidetica::Snapshot,
     ) -> anyhow::Result<Vec<SessionIndex>> {
-        Self::list_sessions_in(&self.chaz_group.new_transaction_at(at).await?).await
+        Self::list_sessions_in(&self.chaz_group.new_transaction_at(at).await?, true).await
     }
 
-    async fn list_sessions_in(txn: &eidetica::Transaction) -> anyhow::Result<Vec<SessionIndex>> {
+    async fn list_sessions_in(
+        txn: &eidetica::Transaction,
+        include_names: bool,
+    ) -> anyhow::Result<Vec<SessionIndex>> {
         let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
-        let names = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
         let routing_doc = sessions.get_all().await?;
         let catalog_doc = catalog.get_all().await?;
-        let names_doc = names.get_all().await?;
+        let names_doc = if include_names {
+            txn.get_store::<DocStore>(STORE_SESSION_NAMES)
+                .await?
+                .get_all()
+                .await?
+        } else {
+            Doc::new()
+        };
 
         let names_by_id: std::collections::HashMap<String, String> = names_doc
             .iter()
@@ -959,6 +995,9 @@ impl SessionRegistry {
                 Ok(entry) => entry,
                 Err(error) => {
                     warn!(session_db_id = %key, "Malformed catalog entry: {error:#}");
+                    if !include_names {
+                        continue;
+                    }
                     None
                 }
             };

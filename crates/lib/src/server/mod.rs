@@ -51,6 +51,7 @@ mod build;
 mod exposed_sessions;
 mod job_monitor;
 mod jobs;
+mod resident_sessions;
 pub use job_monitor::{JobMonitor, JobMonitorNode};
 mod runtime_lease;
 mod schedule;
@@ -513,7 +514,7 @@ fn track_owned_task(
 #[derive(Debug)]
 enum LocalAdoptionEvent {
     Started(String),
-    Registered,
+    InitiallyProbed(String),
 }
 
 /// Callback-driven agent server.
@@ -792,11 +793,6 @@ impl Server {
                 Server::processing_loop(server_weak, notify_rx).await;
             }));
         }
-
-        let server_clone = server.clone();
-        server.track_task(tokio::spawn(async move {
-            server_clone.new_session_watcher().await;
-        }));
 
         server
     }
@@ -2438,216 +2434,6 @@ impl Server {
                     error!("Error processing session {sid}: {e}");
                 }
             }
-        }
-    }
-
-    /// Adopt sessions created through the resident executor's local Eidetica
-    /// service. Local frontends only write and observe session state; this
-    /// executor claims and watches the session. Transport bridges keep using
-    /// the separate agent-registry adoption path in `server::build`.
-    async fn new_session_watcher(&self) {
-        if !self.executor_authorized {
-            return;
-        }
-        let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
-            return;
-        };
-        use futures::StreamExt as _;
-        use std::collections::VecDeque;
-        use std::time::Duration;
-        use tokio::time::Instant;
-
-        enum Adoption {
-            Fresh,
-            Backfill,
-            Retry,
-            Settled,
-        }
-
-        let mut known = HashMap::new();
-        let mut initial_scan = true;
-        let mut refresh = true;
-        let mut fresh: VecDeque<crate::session::SessionIndex> = VecDeque::new();
-        let mut backfill = VecDeque::new();
-        let period = Duration::from_secs(60);
-        let mut reconcile = tokio::time::interval_at(Instant::now() + period, period);
-        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        while !self.shutting_down.load(Ordering::Acquire) {
-            if refresh {
-                // A bounded notification can omit IDs. It invalidates the
-                // snapshot, but the durable catalog still selects candidates.
-                for _ in 0..rx.len() {
-                    let _ = rx.try_recv();
-                }
-                match self.registry.list_sessions().await {
-                    Ok(sessions) => {
-                        fresh.clear();
-                        backfill.clear();
-                        let mut retries = Vec::new();
-                        for session in sessions {
-                            let state = known.entry(session.session_db_id.clone()).or_insert(
-                                if initial_scan {
-                                    Adoption::Backfill
-                                } else {
-                                    Adoption::Fresh
-                                },
-                            );
-                            match state {
-                                Adoption::Fresh => fresh.push_back(session),
-                                Adoption::Backfill => backfill.push_back(session),
-                                Adoption::Retry => retries.push(session),
-                                Adoption::Settled => {}
-                            }
-                        }
-                        backfill.extend(retries);
-                        initial_scan = false;
-                    }
-                    Err(error) => {
-                        error!(%error, "Failed to scan indexed sessions for resident execution");
-                    }
-                }
-            }
-
-            // Check for additions between small waves rather than waiting for
-            // the entire backlog. One slot favors a new row, one favors old
-            // work; cap pressure on the shared service even when both fill.
-            let first = fresh.pop_front().or_else(|| backfill.pop_front());
-            let second = backfill.pop_front().or_else(|| fresh.pop_front());
-            let mut batch = futures::stream::iter([first, second].into_iter().flatten())
-                .map(|session| async move {
-                    let id = session.session_db_id.clone();
-                    let settled = self.adopt_local_client_session(session).await;
-                    (id, settled)
-                })
-                .buffer_unordered(2);
-            while let Some((id, settled)) = batch.next().await {
-                known.insert(
-                    id,
-                    if settled {
-                        Adoption::Settled
-                    } else {
-                        Adoption::Retry
-                    },
-                );
-            }
-
-            refresh = tokio::select! {
-                biased;
-                _ = self.shutdown_notify.notified() => break,
-                event = rx.recv() => {
-                    if event.is_none() { break; }
-                    true
-                }
-                _ = reconcile.tick() => true,
-                _ = std::future::ready(()), if !fresh.is_empty() || !backfill.is_empty() => false,
-            };
-        }
-    }
-
-    /// Return true when the row is settled for this process. A transient open
-    /// or registration failure remains eligible on the next catalog scan.
-    async fn adopt_local_client_session(&self, session: crate::session::SessionIndex) -> bool {
-        if session
-            .source
-            .as_deref()
-            .is_some_and(|s| s.starts_with("job-stage:"))
-        {
-            if session.status == crate::session::SessionStatus::Closed {
-                return true;
-            }
-            let opened = match self.registry.open_session(&session.session_db_id).await {
-                Ok(db) => Ok(db),
-                Err(_) => self.registry.open_job_session(&session.session_db_id).await,
-            };
-            return match opened {
-                Ok((_, db)) => match self.register_accepted_job(&db).await {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        warn!(session_db_id = %session.session_db_id, %error, "Job adoption refused");
-                        false
-                    }
-                },
-                Err(error) => {
-                    debug!(session_db_id = %session.session_db_id, %error, "Job DB unavailable for adoption");
-                    false
-                }
-            };
-        }
-        if self
-            .registry
-            .created_session_locally(&session.session_db_id)
-            .await
-            || session.status == crate::session::SessionStatus::Closed
-            || session
-                .source
-                .as_deref()
-                .is_some_and(|source| source.starts_with("spawn:"))
-        {
-            return true;
-        }
-        info!(
-            session_db_id = %session.session_db_id,
-            source = ?session.source,
-            "New session detected"
-        );
-        #[cfg(test)]
-        if let Some(events) = self.local_adoption_events.get() {
-            let _ = events.send(LocalAdoptionEvent::Started(session.session_db_id.clone()));
-        }
-        let mut opened = self
-            .registry
-            .open_local_client_session(&session.session_db_id)
-            .await;
-        if opened.is_err() {
-            // The service can publish the group-index write just before the
-            // session's auth tree is visible. Bound the race rather than
-            // misclassifying the session as bridge-owned forever.
-            for _ in 0..20 {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                opened = self
-                    .registry
-                    .open_local_client_session(&session.session_db_id)
-                    .await;
-                if opened.is_ok() {
-                    break;
-                }
-            }
-        }
-        let Ok((_conversation_id, session_db)) = opened else {
-            debug!(
-                session_db_id = %session.session_db_id,
-                "New session is not owned by this local client/executor; leaving it to bridge adoption"
-            );
-            return false;
-        };
-        if let Err(error) = self
-            .register_session(
-                &session_db,
-                self.default_backend.clone(),
-                None,
-                // Local CLI/TUI clients have no bridge approval relay. Match
-                // their direct-executor behavior by denying gated tools
-                // immediately instead of creating a request nobody can answer.
-                None,
-            )
-            .await
-        {
-            error!(
-                session_db_id = %session.session_db_id,
-                %error,
-                "Failed to register resident runtime for local session"
-            );
-            false
-        } else {
-            info!(
-                session_db_id = %session.session_db_id,
-                "Resident executor registered local client session"
-            );
-            #[cfg(test)]
-            if let Some(events) = self.local_adoption_events.get() {
-                let _ = events.send(LocalAdoptionEvent::Registered);
-            }
-            true
         }
     }
 

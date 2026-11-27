@@ -372,16 +372,31 @@ covers commits after the snapshot; the catch-up read covers work already
 present before registration. Repeated callbacks are safe:
 the persisted request and attempt state decides whether there is work to run.
 
-When a local service client creates a session, the resident executor treats the
-peer-local session index as a durable adoption queue. It proves that the shared
-user's default key has write authority on the new session, binds that signing
-identity, claims the runtime, and registers the ordinary watch/catch-up path.
-The executor scans existing rows on startup and rescans after index writes, so
-a queued ordinary turn survives notification loss and executor restart. This
-scan skips `spawn:` children: their narrowed runtime is installed by the
-spawning executor, not reconstructed from the catalog. This path does not
-add transport exposure metadata; bridge-created sessions continue through
-the agent registry's `exposed_on` adoption path.
+The resident executor uses the local session catalog to discover roots on
+startup and after catalog changes. A local service client's prompt is a write
+to the **session**, not the catalog. The executor binds a native watch with the
+account's existing signing authority; a watch alone does not register a
+runtime, acquire a lease, or edit the transcript.
+
+The first watch delivery is the current snapshot, not a replay of writes made
+while the executor was stopped. On first upgrade, the executor checks
+unindexed sessions in bounded parallelism and saves proven idle frontiers in
+`chaz_peer`. An ordinary restart or reconnect reuses a proof only for the same
+session frontier and Agent roster. A changed frontier is checked for queued
+turns, commands, and recoverable wait checkpoints, even if the latest write
+was not the request itself. An unversioned transcript retains its historical
+cutoff without a write until there is work to activate. Failed checks are not
+recorded as idle. New catalog entries and live wakes have capacity separate
+from startup backfill; there is no periodic catalog scan.
+
+When a probe finds work, the executor rechecks the catalog row and signing
+authority, then uses the normal runtime claim and processing path. Agent-owned
+schedules still load from their Agent DBs, and local legacy routine rows are
+discovered without claiming idle runtimes. This path does not add transport
+exposure metadata; bridge-created sessions continue through the Agent
+registry's `exposed_on` adoption path. Catalog discovery skips `spawn:` Worker
+children: their narrowed runtime is installed by the spawning executor, not
+reconstructed from the catalog.
 
 An interrupted attempt is deliberately not replayed. Model and tool work may
 already have caused an external effect before the process stopped. The only

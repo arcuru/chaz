@@ -219,6 +219,20 @@ impl RoutineEngine {
         session_db: &Database,
     ) -> anyhow::Result<()> {
         let routines = load_routines_table(session_db, SESSION_ROUTINES_STORE).await?;
+        self.register_session_routines(session_db_id, routines)
+            .await;
+        Ok(())
+    }
+
+    /// Seed the engine from rows already read by a pinned resident probe.
+    pub(crate) async fn register_session_routines(
+        &self,
+        session_db_id: &str,
+        routines: Vec<Routine>,
+    ) {
+        if routines.is_empty() {
+            return;
+        }
         let last_fired = load_last_fired(
             &self.chaz_peer,
             routines.iter().map(|routine| routine.id.clone()).collect(),
@@ -241,7 +255,6 @@ impl RoutineEngine {
         }
         drop(state);
         self.notify.notify_one();
-        Ok(())
     }
 
     /// Drop every in-memory routine tied to `session_db_id`. The

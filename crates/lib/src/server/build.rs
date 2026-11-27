@@ -33,8 +33,7 @@ pub struct BuildOptions {
     /// Path the config was loaded from; recorded on the server so `/agent
     /// reload` (and config reconcile) can re-read it.
     pub config_path: PathBuf,
-    /// Spawn the routine engine (heartbeats + schedulers) and register every
-    /// hosted session/agent with it. Off for one-shot CLI runs.
+    /// Spawn the routine engine (heartbeats + schedulers). Off for one-shot CLI runs.
     pub run_routine_engine: bool,
     /// Spawn the agent-running `processing_loop`. True for the chaz daemon,
     /// which runs agents. A standalone (dumb) bridge sets this **false**: it
@@ -496,16 +495,21 @@ pub async fn build(
         "Startup: peer defaults loaded"
     );
     let t = Instant::now();
+    let targeted_indices = opts.targeted_session.is_some()
+        && (!targeted_agents.is_empty() || !configured_defaults.is_empty());
+    let indexed_sessions = if targeted_indices {
+        Default::default()
+    } else {
+        registry.indexed_session_ids().await?
+    };
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
-        // Without configured defaults a targeted client cannot name the
-        // agents a new session attaches, so it indexes every hosted agent.
-        if opts.targeted_session.is_some() && !configured_defaults.is_empty() {
+        if targeted_indices {
             let (agents, memory_banks, skill_banks, _) =
                 hosted_index::build_targeted(&user, &targeted_agents, &configured_defaults).await?;
             (agents, memory_banks, skill_banks)
         } else {
-            hosted_index::build_from_user(&user).await?
+            hosted_index::build_excluding_sessions(&user, &indexed_sessions).await?
         }
     };
     info!(
@@ -513,13 +517,13 @@ pub async fn build(
         "Startup: hosted indices loaded"
     );
 
-    // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
+    // Surface pre-existing co-owned agents whose `home_pubkey` is
     // still unset (legacy default). These keep working as before — any
     // keyholder may run — but on co-owned agents that's the multi-peer
     // race the home-peer system exists to fix. WARN with the recovery
     // command so operators see actionable migration guidance instead of
     // silent forks.
-    if opts.targeted_session.is_none() {
+    if executor_components && opts.targeted_session.is_none() {
         warn_unset_home_pubkey_on_coowned(&registry, &agent_index_store).await;
     }
 
@@ -830,7 +834,6 @@ pub async fn build(
         mcp_registry.clone(),
         executor,
     );
-    let targeted_indices = opts.targeted_session.is_some() && !configured_defaults.is_empty();
     if !targeted_indices {
         server.mark_hosted_indices_complete();
     }
@@ -1156,11 +1159,8 @@ async fn run_deferred_startup(
         }
     }
 
-    // 3b. Spawn the routine engine. Loads global routines from
-    //     `chaz_peer.routines`, then walks every hosted session and
-    //     registers its session-scoped routines (heartbeats + scheduler
-    //     fires). Skipped for one-shot CLI: a single ReAct loop doesn't
-    //     need the engine running.
+    // 3b. Load global and Agent-owned routines. The resident watcher loads
+    //     legacy session routines from the same frontier it checks for work.
     if run_routine_engine {
         let chaz_peer = registry.chaz_peer().clone();
         let engine =
@@ -1176,31 +1176,6 @@ async fn run_deferred_startup(
         // mutation (the `/schedule` command, `schedule_*` tools, `schedule_once`,
         // and `agent_delete`'s sweep).
         server.set_routine_engine(engine.clone());
-        // Pick up every session's routines + ensure the server is
-        // watching those sessions so directive writes from fires drive
-        // an agent turn.
-        let sessions = registry.list_sessions().await.unwrap_or_default();
-        for s in sessions {
-            let Ok((_conv, sdb)) = registry.open_session(&s.session_db_id).await else {
-                continue;
-            };
-            if let Err(e) = engine.register_session(&s.session_db_id, &sdb).await {
-                error!(session = %s.session_db_id, "engine.register_session failed: {e}");
-                continue;
-            }
-            let routines = routine::list_session_routines(&sdb)
-                .await
-                .unwrap_or_default();
-            if routines.is_empty() {
-                continue;
-            }
-            if let Err(e) = server
-                .register_session(&sdb, default_backend.clone(), None, None)
-                .await
-            {
-                error!(session = %s.session_db_id, "server.register_session failed: {e}");
-            }
-        }
         // Register every hosted agent's own schedules (Agent-Owned
         // Schedules). The agent is the unit of ownership; chaz is the
         // runtime that loads it and fires the callback. Schedules persist
@@ -1234,6 +1209,7 @@ async fn run_deferred_startup(
     //    agent on sessions a (dumb) bridge created and exposed. Only the
     //    agent-running peer does this — a bridge sets `run_agent_loop:false`.
     if run_agent_loop {
+        server.start_resident_session_watcher();
         watch_agent_session_registries(server.clone(), registry.clone(), default_backend.clone())
             .await;
     }
@@ -1937,8 +1913,7 @@ fn warn_unhosted_agent_references(server: &Server) {
 }
 
 /// Startup migration WARN: any locally-hosted agent that is co-owned
-/// (more than one active AuthKey) but has no `home_pubkey` set — either
-/// on its meta store (agent-level) or on a session's AgentRef — is still
+/// (more than one active AuthKey) but has no agent-level `home_pubkey` set is still
 /// running on the legacy multi-peer "any keyholder runs" path that the
 /// home-peer system exists to fix. WARN with the exact `/agent rehost`
 /// command the operator should run.
@@ -1950,10 +1925,6 @@ async fn warn_unset_home_pubkey_on_coowned(
     agent_index: &hosted_index::HostedIndex,
 ) {
     let agents = agent_index.list();
-    let Ok(sessions) = registry.list_sessions().await else {
-        return;
-    };
-
     for entry in &agents {
         // Count active AuthKeys on the agent DB.
         let active_count = match registry
@@ -1998,29 +1969,6 @@ async fn warn_unset_home_pubkey_on_coowned(
                  from the peer that should own them.",
                 entry.display_name
             );
-        }
-
-        // Per-session home_pubkey scan.
-        for s in &sessions {
-            let Ok((_conv, db)) = registry.open_session(&s.session_db_id).await else {
-                continue;
-            };
-            let meta = session::read_meta_from_db(&db).await;
-            if let Some(ar) = meta
-                .agents
-                .iter()
-                .find(|a| a.db_id == entry.db_id.to_string())
-                && ar.home_pubkey.is_none()
-            {
-                warn!(
-                    session_db_id = %s.session_db_id,
-                    agent = %entry.display_name,
-                    "Co-owned agent has no home_pubkey on this session — multiple peers \
-                     may both respond. Run `/agent rehost {}` from the peer that should \
-                     own execution.",
-                    entry.display_name
-                );
-            }
         }
     }
 }

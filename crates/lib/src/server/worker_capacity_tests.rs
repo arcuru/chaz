@@ -881,7 +881,7 @@ async fn prepared_worker_reference_and_catalog_are_not_execution_requests() {
         .unwrap(),
     );
     let (_second_owner, observer, _) = server_fixture_from_registry(observer_registry).await;
-    assert!(observer.adopt_local_client_session(row).await);
+    assert!(!super::resident_sessions::is_resident_candidate(&row));
     assert!(
         observer
             .sessions

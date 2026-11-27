@@ -24,6 +24,19 @@ pub use types::{
 use eidetica::Database;
 use eidetica::store::Table;
 
+pub(crate) async fn list_session_routines_at(
+    session_db: &Database,
+    at: &eidetica::Snapshot,
+) -> anyhow::Result<Vec<Routine>> {
+    let txn = session_db.new_transaction_at(at).await?;
+    let rows = txn
+        .get_store::<Table<Routine>>(SESSION_ROUTINES_STORE)
+        .await?
+        .search(|_| true)
+        .await?;
+    Ok(rows.into_iter().map(|(_, routine)| routine).collect())
+}
+
 /// List every routine row in a session DB's `routines` table.
 ///
 /// Returns `Ok(Vec::new())` when the table doesn't exist yet (a session

@@ -190,7 +190,16 @@ impl Session {
         if attempt_ids.is_empty() {
             return Ok(false);
         }
-        let txn = database.new_transaction().await?;
+        Self::has_job_wait_checkpoint_in(&database.new_transaction().await?, attempt_ids).await
+    }
+
+    pub(super) async fn has_job_wait_checkpoint_in(
+        txn: &eidetica::Transaction,
+        attempt_ids: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<bool> {
+        if attempt_ids.is_empty() {
+            return Ok(false);
+        }
         Ok(!txn
             .get_store::<Table<JobWaitCheckpoint>>(JOB_WAIT_CHECKPOINTS_STORE)
             .await?

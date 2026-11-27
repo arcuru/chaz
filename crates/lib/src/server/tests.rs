@@ -5272,9 +5272,10 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     assert!(!client_server.is_watching_session(&sid).await);
     assert!(client_server.runtime_owner_of(&sid).is_none());
     write_user_message_with_content(&client_db, &sid, "hello resident executor").await;
-    let old_count = 20;
-    for _ in 1..old_count {
-        client_registry.create_session(Some("old")).await.unwrap();
+    let mut idle = std::collections::HashSet::new();
+    for _ in 0..19 {
+        let (id, _) = client_registry.create_session(Some("old")).await.unwrap();
+        idle.insert(id.0);
     }
 
     // Connect and construct the resident after the client has queued its turn.
@@ -5323,6 +5324,7 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     // current-thread runtime. It signals before trying to take startup_hold.
     let (adoption_tx, mut adoption_rx) = mpsc::unbounded_channel();
     executor.local_adoption_events.set(adoption_tx).unwrap();
+    executor.start_resident_session_watcher();
     assert!(matches!(
         tokio::time::timeout(ASYNC_TEST_TIMEOUT, adoption_rx.recv())
             .await
@@ -5335,28 +5337,24 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
         .await
         .unwrap();
     write_user_message_with_content(&fresh_db, &fresh_id.0, "hello during adoption").await;
-    drop(startup_hold);
-
-    let old_registered = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
-        let mut registered = 0;
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             match adoption_rx
                 .recv()
                 .await
                 .expect("resident adoption observer")
             {
-                LocalAdoptionEvent::Started(id) if id == fresh_id.0 => return registered,
-                LocalAdoptionEvent::Registered => registered += 1,
+                LocalAdoptionEvent::Started(id) if id == fresh_id.0 => break,
+                LocalAdoptionEvent::InitiallyProbed(id) => {
+                    panic!("backfill was supposed to be held, probed {id}");
+                }
                 LocalAdoptionEvent::Started(_) => {}
             }
         }
     })
     .await
-    .expect("the resident must discover the newly published session");
-    assert!(
-        (1..old_count).contains(&old_registered),
-        "fresh pickup must happen during backfill, not after it (old rows registered: {old_registered}/{old_count})"
-    );
+    .expect("fresh discovery must not wait for a held startup probe");
+    drop(startup_hold);
 
     await_call_count(&mock, 2).await;
     assert!(await_agent_reply(&fresh_db, &fresh_id.0, "default").await);
@@ -5366,6 +5364,18 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     );
     assert!(executor.is_watching_session(&sid).await);
     assert!(executor.runtime_owner_of(&sid).is_some());
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+        while !idle.is_empty() {
+            if let LocalAdoptionEvent::InitiallyProbed(id) = adoption_rx.recv().await.unwrap()
+                && idle.remove(&id)
+            {
+                assert!(executor.runtime_owner_of(&id).is_none());
+                assert!(!executor.is_watching_session(&id).await);
+            }
+        }
+    })
+    .await
+    .expect("idle backfill should finish without taking runtime leases");
     let session_ref = agent_db.find_session_ref(&sid).await.unwrap().unwrap();
     assert!(
         session_ref.exposed_on.is_empty(),
@@ -5392,6 +5402,7 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     .await
     .expect("local session publication must notify the bound Agent DB subscriber");
 
+    executor.shutdown().await;
     drop(client_server);
     drop(executor);
     drop(client_registry);
@@ -6276,11 +6287,6 @@ async fn published_executor_using_mock_and_hub(
         .await
         .unwrap(),
     );
-    if !resident_adoption {
-        // Manual-admission fixtures own the one-shot subscription before the
-        // Server can start its competing resident adopter.
-        drop(registry.subscribe_new_sessions().await.unwrap());
-    }
     let index = HostedIndex::empty("agent");
     index.register(agent.clone());
     let backend = crate::backends::BackendManager::with_mock(
@@ -6312,6 +6318,9 @@ async fn published_executor_using_mock_and_hub(
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
     );
+    if resident_adoption {
+        server.start_resident_session_watcher();
+    }
     (server, mock)
 }
 
@@ -7639,8 +7648,6 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
 async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
     use crate::runtime::RuntimeMessage;
     use crate::test_support::MockBackend;
-    // Only this test's executor may watch the registry: a second server
-    // would race it for the one new-session subscription.
     let (_instance, user) =
         Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
             .await
@@ -7708,6 +7715,7 @@ async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
         .attach_agent_to_session(&parent_id.0, &parent)
         .await
         .unwrap();
+    server.start_resident_session_watcher();
     let id = server
         .submit_agent_job(&parent_id.0, "child", "inspect your own tools")
         .await

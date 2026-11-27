@@ -24,7 +24,7 @@ use eidetica::auth::crypto::PublicKey;
 use eidetica::entry::ID;
 use eidetica::{AccountSession, Database};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
@@ -193,12 +193,22 @@ impl HostedIndex {
 pub async fn build_from_user(
     user: &AccountSession,
 ) -> anyhow::Result<(HostedIndex, HostedIndex, HostedIndex)> {
+    build_excluding_sessions(user, &HashSet::new()).await
+}
+
+pub(crate) async fn build_excluding_sessions(
+    user: &AccountSession,
+    sessions: &HashSet<ID>,
+) -> anyhow::Result<(HostedIndex, HostedIndex, HostedIndex)> {
     let agents = HostedIndex::empty("agent");
     let memory_banks = HostedIndex::empty("memory_bank");
     let skill_banks = HostedIndex::empty("skill_bank");
 
     let tracked = user.databases().await?;
     for td in tracked {
+        if sessions.contains(&td.database_id) {
+            continue;
+        }
         let database = match user
             .open_database_with_key(&td.database_id, &td.key_id)
             .await
@@ -209,6 +219,7 @@ pub async fn build_from_user(
                 continue;
             }
         };
+        debug!(db_id = %td.database_id, "Opened tracked DB for hosted discovery");
         let Some((kind, marker_name)) = crate::db_kind::read_marker(&database).await else {
             continue;
         };
@@ -319,6 +330,7 @@ pub async fn extend_targeted(
                             td.database_id
                         )
                     })?;
+                debug!(db_id = %td.database_id, "Opened DB for named Agent discovery");
                 if db.get_name().await? != db_name {
                     stats.non_agent_candidate_opens += 1;
                     continue;
