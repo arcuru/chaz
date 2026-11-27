@@ -99,7 +99,8 @@ approval steps.
    [Transport Bridges → Setup](bridges.md#setup).
 
 The bot checks the inviter and live senders against the effective `allow_list`
-regex. If neither the login nor the top level sets one, nobody matches. This
+regex. If neither sets one, nobody matches. An explicit `allow_list: ""`, by
+contrast, matches every sender except the bot itself. This
 filter is not a promise to exclude other authors from room history.
 
 On joining an ordinary room, the bridge creates or reuses its session and imports only
@@ -315,7 +316,7 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz sync <ticket>`            | Sync a remote session via ticket URL                                                         |
 | `!chaz compact`                  | Summarize and compact conversation history                                                   |
 | `!chaz context`                  | Context-window usage for this room's agent                                                   |
-| `!chaz print`                    | Print the current conversation context                                                       |
+| `!chaz print`                    | Show session history in the room, including messages from local clients                      |
 | `!chaz stop`                     | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
 
 ### Living Agents
@@ -348,6 +349,10 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz clear`                  | Mark the cutoff for room-history import; does not erase the session           |
 | `!chaz rename`                 | Rename the Matrix room based on conversation content (not in workspace chats) |
 | `!chaz party`                  | 🎉                                                                            |
+
+`!chaz send` and `!chaz rename` need a backend configured **on the bridge**.
+With the minimal config above they produce no model reply or generated room name.
+Ordinary chat uses the executor's backend instead.
 
 ### Workspace
 
@@ -402,7 +407,7 @@ reported rather than claiming detach succeeded.
 | `!chaz participation on`                   | Authorized, executor-confirmed ambient wake for this room; off by default                                    |
 | `!chaz participation off` / `status`       | Stop ambient wake / show confirmed state; messages remain observable                                         |
 | Normal final on a Matrix-origin turn       | Saved locally and queued to the same bound room under the owning agent's login                               |
-| Normal final on a TUI/local/schedule turn  | Saved locally only, even in a Matrix-bound session                                                           |
+| Normal final on a TUI/local/schedule turn  | Saved in the session; not automatically posted to the room                                                   |
 | `no_reply({})` in a Matrix-bound session   | Terminal action: no final message and no room post                                                           |
 | `matrix__send({"body":"text"})`            | Explicit/proactive room send; on a Matrix-origin turn it counts as the reply and the later final stays local |
 | `matrix__room_info({})`                    | Describe this turn's attached Matrix room using cached observations and report the agent's reply actions     |

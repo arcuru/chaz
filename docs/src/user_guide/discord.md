@@ -59,6 +59,10 @@ approval steps.
    empty means everyone (the bot always ignores other bots and its own
    messages).
 
+   If two logins share a settings database, give each a distinct, stable
+   `login_id`. The default is `discord` for every entry, not the bot's account ID.
+   Reusing an ID overwrites the stored token and sender allow-list for that ID.
+
 3. **Run the bridge** (with the daemon already running):
 
    ```bash

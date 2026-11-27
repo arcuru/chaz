@@ -18,12 +18,12 @@ and [Discord Bot](discord.md).
 
 ## Which messages reach a session?
 
-|                        | Matrix                                                                                              | Discord                                                                                                |
-| ---------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Who can send live text | An MXID matching the login or top-level `allow_list` regex. Without a list, nobody.                 | Non-bot members of `allowed_users` (numeric IDs); an empty list allows any non-bot sender.             |
-| First ordinary text    | Send plain text in a direct chat, or use your client's mention picker in a group.                   | Send plain text in a DM **or a server channel**. No mention or prefix is required.                     |
-| Other conversation     | With participation off, eligible unaddressed group text is context only in an attached session.     | An allowed user's channel text goes to the agent even when addressed to someone else.                  |
-| Session selection      | The login and room ID select the session. Ordinary rooms support `!chaz detach` and `!chaz attach`. | The login and channel ID select the session. A session switch in a client does not rebind the channel. |
+|                        | Matrix                                                                                                   | Discord                                                                                                |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Who can send live text | An MXID matching the login or top-level `allow_list` regex. If both settings are absent, nobody matches. | Non-bot members of `allowed_users` (numeric IDs); an empty list allows any non-bot sender.             |
+| First ordinary text    | Send plain text in a direct chat, or use your client's mention picker in a group.                        | Send plain text in a DM **or a server channel**. No mention or prefix is required.                     |
+| Other conversation     | With participation off, eligible unaddressed group text is context only in an attached session.          | An allowed user's channel text goes to the agent even when addressed to someone else.                  |
+| Session selection      | The login and room ID select the session. Ordinary rooms support `!chaz detach` and `!chaz attach`.      | The login and channel ID select the session. A session switch in a client does not rebind the channel. |
 
 `!chaz help` asks the bridge for commands; it does not test whether an agent can answer.
 See [Matrix message handling](matrix.md#message-handling) and [Discord message
@@ -33,14 +33,16 @@ handling](discord.md#message-handling) to try a conversation.
 
 The table describes Matrix's addressed-reply path. Discord still delivers ordinary
 agent messages from the bound session, including replies to turns started elsewhere.
-Don't treat a TUI turn in a Discord-bound session as private.
+Matrix doesn't automatically post a TUI reply, but `!chaz print` can show that
+conversation in the room. Use a separate, unattached session for private work on
+either transport.
 
 | Event                                                      | Shared-session behavior                                                                                  |
 | ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Addressed external message                                 | The attached adapter supplies source facts; core checks the binding and lets a `Message` wake the agent. |
 | Unaddressed observation                                    | Recorded for later context; it does not start a turn.                                                    |
 | Normal final for an external turn                          | If the adapter declares conversational replies, saved locally and queued to that same source.            |
-| Normal final for a TUI, CLI, schedule, or local-agent turn | Remains local even though the session has an external attachment.                                        |
+| Normal final for a TUI, CLI, schedule, or local-agent turn | Saved in the session; not automatically posted to the Matrix room.                                       |
 | `no_reply({})`                                             | Completes without a final or external post on a reply-capable attached session.                          |
 | Explicit `matrix__send`                                    | Queues a deliberate addressed message; its later final does not post twice.                              |
 
@@ -58,7 +60,7 @@ safely reopen sessions containing the new kind.
 
 Example: attach a Matrix room and ask a question there; the final posts to
 that room, and the TUI shows both the local final and the delivery receipt.
-Ask a second question from the TUI in the same session; its final stays local.
+Ask a second question from the TUI in the same session; its final is not automatically posted.
 If the room is detached before a queued reply is sent, the bridge leaves it
 pending rather than publishing it to a different room; reattach deliberately
 and inspect the interrupted or undelivered work before retrying.
