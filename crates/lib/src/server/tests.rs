@@ -5178,17 +5178,8 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 }
 
 #[tokio::test]
-async fn resident_executor_adopts_and_processes_local_client_session() {
-    // Spawned service/callback tasks share this current-thread runtime, so a
-    // thread-local subscriber captures this turn without affecting other tests.
-    let logs = tempfile::NamedTempFile::new().unwrap();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::ERROR)
-        .with_writer(logs.reopen().unwrap())
-        .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
-
+async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
+    use crate::agent_db::AgentDb;
     use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
@@ -5234,6 +5225,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let mock = Arc::new(crate::test_support::MockBackend::new());
     mock.push_text("resident reply");
+    mock.push_text("resident reply");
     let agent_index = HostedIndex::empty("agent");
     agent_index.register(agent.clone());
 
@@ -5250,8 +5242,8 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     let client_agent = client.user.open_database(&agent_db.id()).await.unwrap();
     let (agent_wake_tx, mut agent_wake_rx) = tokio::sync::mpsc::unbounded_channel();
     let _agent_callback = client_agent
-        .on_write(move |_, _| {
-            agent_wake_tx.send(()).unwrap();
+        .on_write(move |snapshot, _| {
+            let _ = agent_wake_tx.send(snapshot.clone());
             std::future::ready(Ok(()))
         })
         .await
@@ -5280,6 +5272,10 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     assert!(!client_server.is_watching_session(&sid).await);
     assert!(client_server.runtime_owner_of(&sid).is_none());
     write_user_message_with_content(&client_db, &sid, "hello resident executor").await;
+    let old_count = 20;
+    for _ in 1..old_count {
+        client_registry.create_session(Some("old")).await.unwrap();
+    }
 
     // Connect and construct the resident after the client has queued its turn.
     // This is the daemon-restart shape: the new registry has no in-memory
@@ -5296,6 +5292,9 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         mock.clone(),
         crate::security::SecretStore::new(executor_registry.chaz_peer().clone()).await,
     );
+    // Keep the first adoption wave in flight until the client publishes the
+    // new row. It must not be present in the executor's first snapshot.
+    let startup_hold = executor_registry.user_lock().await;
     let executor = Server::new(
         executor_registry.clone(),
         agents.clone(),
@@ -5320,10 +5319,50 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         Some(crate::instance::ExecutorCapability::for_test()),
     );
 
-    await_call_count(&mock, 1).await;
+    // Install the observer before yielding to the spawned watcher on this
+    // current-thread runtime. It signals before trying to take startup_hold.
+    let (adoption_tx, mut adoption_rx) = mpsc::unbounded_channel();
+    executor.local_adoption_events.set(adoption_tx).unwrap();
+    assert!(matches!(
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, adoption_rx.recv())
+            .await
+            .expect("startup snapshot did not begin adoption"),
+        Some(LocalAdoptionEvent::Started(_))
+    ));
+    let (fresh_id, fresh_db) = client_registry.create_session(Some("fresh")).await.unwrap();
+    client_registry
+        .attach_agent_to_session(&fresh_id.0, &agent)
+        .await
+        .unwrap();
+    write_user_message_with_content(&fresh_db, &fresh_id.0, "hello during adoption").await;
+    drop(startup_hold);
+
+    let old_registered = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+        let mut registered = 0;
+        loop {
+            match adoption_rx
+                .recv()
+                .await
+                .expect("resident adoption observer")
+            {
+                LocalAdoptionEvent::Started(id) if id == fresh_id.0 => return registered,
+                LocalAdoptionEvent::Registered => registered += 1,
+                LocalAdoptionEvent::Started(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("the resident must discover the newly published session");
+    assert!(
+        (1..old_count).contains(&old_registered),
+        "fresh pickup must happen during backfill, not after it (old rows registered: {old_registered}/{old_count})"
+    );
+
+    await_call_count(&mock, 2).await;
+    assert!(await_agent_reply(&fresh_db, &fresh_id.0, "default").await);
     assert!(
         await_agent_reply(&client_db, &sid, "default").await,
-        "the resident executor must write the reply into the client-created session"
+        "the resident executor must still recover the prompt queued before restart"
     );
     assert!(executor.is_watching_session(&sid).await);
     assert!(executor.runtime_owner_of(&sid).is_some());
@@ -5333,6 +5372,26 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         "local execution must not fabricate transport exposure metadata"
     );
 
+    // Observe the actual publication via the bound subscription, not the
+    // absence of an SDK error log (which may be filtered).
+    let client_agent = AgentDb::from_database(client_agent);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let published = agent_wake_rx.recv().await.expect("bound Agent DB observer");
+            if client_agent
+                .list_session_refs_at(&published)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.session_db_id == sid)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("local session publication must notify the bound Agent DB subscriber");
+
     drop(client_server);
     drop(executor);
     drop(client_registry);
@@ -5340,15 +5399,11 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     drop(shutdown);
     task.await.unwrap().unwrap();
 
-    let logs = std::fs::read_to_string(logs.path()).unwrap();
-    assert!(
-        !logs.contains("Failed to open database for callbacks"),
-        "local service turn must not reopen callback trees with the login key: {logs}"
+    assert_eq!(
+        mock.recorded_calls().len(),
+        2,
+        "one call per distinct prompt"
     );
-    tokio::time::timeout(std::time::Duration::from_secs(2), agent_wake_rx.recv())
-        .await
-        .expect("local session publication must notify the bound Agent DB subscriber")
-        .unwrap();
 }
 
 #[tokio::test]
