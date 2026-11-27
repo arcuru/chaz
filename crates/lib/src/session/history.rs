@@ -681,9 +681,7 @@ pub(super) async fn entry_rows(
 ) -> anyhow::Result<Vec<(TurnRequestId, SessionEntry)>> {
     let mut rows = rows::<SessionEntry>(txn, store_name).await?;
     rows.sort_by(|(left_id, left), (right_id, right)| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left_id.cmp(right_id))
+        legacy_order_key(left_id, left).cmp(&legacy_order_key(right_id, right))
     });
     Ok(rows
         .into_iter()
@@ -708,6 +706,14 @@ pub(super) async fn entry_rows(
             (TurnRequestId::parse(id), entry)
         })
         .collect())
+}
+
+/// Display order for dated history. Table order is not conversation order.
+pub(crate) fn legacy_order_key<'a>(
+    id: &'a str,
+    entry: &SessionEntry,
+) -> (chrono::DateTime<chrono::Utc>, &'a str) {
+    (entry.timestamp, id)
 }
 
 #[cfg(test)]

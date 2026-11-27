@@ -1164,6 +1164,34 @@ async fn exercise_session_copy(service: bool) {
         .await
         .unwrap();
     let (source_id, db) = owner.create_session(Some("other")).await.unwrap();
+    owner
+        .set_session_name(&here_id, "scratchpad".into())
+        .await
+        .unwrap();
+    owner
+        .set_session_name(&source_id.0, "lighthouse-planning".into())
+        .await
+        .unwrap();
+    crate::session::set_session_description(&db, Some("human-only-description"))
+        .await
+        .unwrap();
+    let (hidden_id, hidden_db) = owner.create_session(Some("decoy")).await.unwrap();
+    owner
+        .set_session_name(&hidden_id.0, "lighthouse-restricted".into())
+        .await
+        .unwrap();
+    owner
+        .attach_agent_to_session(&hidden_id.0, &actor)
+        .await
+        .unwrap();
+    let revoke = hidden_db.new_transaction().await.unwrap();
+    revoke
+        .get_settings()
+        .unwrap()
+        .revoke_auth_key(&actor.pubkey)
+        .await
+        .unwrap();
+    revoke.commit().await.unwrap();
     let page_arg = json!({"session_db_id":source_id.0});
     assert!(browse.execute(page_arg.clone(), &ctx).await.is_err());
     owner
@@ -1195,34 +1223,88 @@ async fn exercise_session_copy(service: bool) {
             .unwrap()
             .contains(here_msg.as_str())
     );
-    let mut source_session = Session::new(source_id.clone(), db.clone()).await;
-    let mut ids = Vec::new();
-    for _ in 0..9 {
-        ids.push(
-            source_session
-                .add_entry(msg.clone())
-                .await
-                .unwrap()
-                .to_string(),
-        );
+    let source = db.new_transaction().await.unwrap();
+    let entries = source
+        .get_store::<Table<SessionEntry>>("entries")
+        .await
+        .unwrap();
+    // Native keys run backwards relative to conversation time. The last two
+    // messages have the same timestamp; use the canonical ID tie-break.
+    let ids = [
+        "row-9", "row-8", "row-7", "row-6", "row-5", "row-4", "row-3", "row-1", "row-2",
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        let mut row = msg.clone();
+        row.timestamp += chrono::Duration::seconds(i.min(7) as i64);
+        entries.set(*id, row).await.unwrap();
     }
-    ids.sort();
-    let selected = &ids[8];
+    let mut audit = msg.clone();
+    audit.entry_type = EntryType::ToolResult;
+    audit.content = "not-a-chat-excerpt".into();
+    entries.set("audit", audit).await.unwrap();
+    source.commit().await.unwrap();
+    let selected = ids[8];
     let listing = browse.execute(json!({}), &ctx).await.unwrap();
-    assert!(listing.contains(&here_id) && listing.contains(&source_id.0));
-    let page: Value =
-        serde_json::from_str(&browse.execute(page_arg.clone(), &ctx).await.unwrap()).unwrap();
+    let listed: Value = serde_json::from_str(&listing).unwrap();
+    assert!(!listing.contains(&hidden_id.0) && !listing.contains("lighthouse-restricted"));
+    assert!(!listing.contains("human-only-description"));
+    assert!(
+        listed["sessions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(here_id))
+    );
+    assert!(
+        listed["sessions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(source_id.0))
+    );
+    assert!(
+        browse
+            .execute(json!({"session_db_id":hidden_id.0}), &ctx)
+            .await
+            .is_err()
+    );
+    let source_snapshot = db.snapshot().await.unwrap();
+    let page_str = browse.execute(page_arg.clone(), &ctx).await.unwrap();
+    assert!(!page_str.contains("not-a-chat-excerpt"));
+    let page: Value = serde_json::from_str(&page_str).unwrap();
+    let page_ids: Vec<_> = page["untrusted_message_excerpts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["message_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page_ids, ids[..8]);
+    assert_eq!(listed["untrusted_session_names"][&here_id], "scratchpad");
     assert_eq!(
-        page["untrusted_message_excerpts"].as_array().unwrap().len(),
-        8
+        listed["untrusted_session_names"][&source_id.0],
+        "lighthouse-planning"
     );
     let next = json!({"session_db_id":source_id.0, "cursor":page["next_cursor"].as_str().unwrap()});
+    assert_eq!(db.snapshot().await.unwrap(), source_snapshot);
+    // A write between pages cannot change the snapshot being inspected.
+    let source = db.new_transaction().await.unwrap();
+    source
+        .get_store::<Table<SessionEntry>>("entries")
+        .await
+        .unwrap()
+        .set("later-key", msg.clone())
+        .await
+        .unwrap();
+    source.commit().await.unwrap();
+    let after_write = db.snapshot().await.unwrap();
     let last: Value =
         serde_json::from_str(&browse.execute(next.clone(), &ctx).await.unwrap()).unwrap();
     assert_eq!(
-        last["untrusted_message_excerpts"][0]["message_id"],
-        selected.as_str()
+        last["untrusted_message_excerpts"],
+        json!([{
+            "message_id": selected, "sender": msg.sender, "timestamp": msg.timestamp + chrono::Duration::seconds(7),
+            "text":msg.content, "truncated": false
+        }])
     );
+    assert_eq!(db.snapshot().await.unwrap(), after_write);
     assert!(last["next_cursor"].is_null());
     // After restart cursors expire, but a selected native row ID is durable.
     assert!(
@@ -1412,6 +1494,7 @@ async fn session_excerpt_growth() {
     let recall = Recall::new(reg, index, None);
     let mut ctx = make_ctx("reader", here);
     ctx.agent_identity = Some(actor);
+    let origin = Utc::now();
     let mut previous = 0;
     for rows in [64, 512, 2048] {
         // A batch of eight records includes four ordinary chat messages plus
@@ -1436,7 +1519,7 @@ async fn session_excerpt_growth() {
                         SessionEntry {
                             sender: "Alice".into(),
                             content: format!("lighthouse {i} {}", "x".repeat(bytes)),
-                            timestamp: Utc::now(),
+                            timestamp: origin - chrono::Duration::seconds(i as i64),
                             entry_type: kind,
                             metadata: None,
                             routing: None,
@@ -1451,27 +1534,64 @@ async fn session_excerpt_growth() {
         let start_bytes = disk_bytes();
         let args = json!({"session_db_id":source.0});
         let mut pages = vec![];
-        let mut page_len = 0;
-        let mut next_cursor = Value::Null;
         for _ in 0..4 {
             let t = Instant::now();
-            let result = browse.execute(args.clone(), &ctx).await.unwrap();
-            pages.push(t.elapsed().as_micros());
-            page_len = result.len();
-            let page: Value = serde_json::from_str(&result).unwrap();
+            let mut request = args.clone();
+            let page = loop {
+                let result = browse.execute(request.clone(), &ctx).await.unwrap();
+                let page: Value = serde_json::from_str(&result).unwrap();
+                if !page["untrusted_message_excerpts"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+                {
+                    break page;
+                }
+                assert!(!page["next_cursor"].is_null());
+                request["cursor"] = page["next_cursor"].clone();
+            };
             assert_eq!(
                 page["untrusted_message_excerpts"].as_array().unwrap().len(),
-                4
+                8
             );
-            next_cursor = page["next_cursor"].clone();
+            pages.push(t.elapsed().as_micros());
         }
         let t = Instant::now();
-        let next = browse
-            .execute(json!({"session_db_id":source.0,"cursor":next_cursor}), &ctx)
-            .await
-            .unwrap();
-        let next_us = t.elapsed().as_micros();
-        assert!(next.contains("row-000008"));
+        let mut request = args;
+        let mut seen = Vec::new();
+        let mut empty_pages = 0;
+        let mut page_len = 0;
+        // Include the first page past a 64-excerpt window, crossing both
+        // scan and output continuations at the largest fixture size.
+        for _ in 0..32 {
+            let result = browse.execute(request.clone(), &ctx).await.unwrap();
+            let page: Value = serde_json::from_str(&result).unwrap();
+            let excerpts = page["untrusted_message_excerpts"].as_array().unwrap();
+            page_len = page_len.max(result.len());
+            if excerpts.is_empty() {
+                empty_pages += 1;
+            }
+            seen.extend(
+                excerpts
+                    .iter()
+                    .map(|row| row["message_id"].as_str().unwrap().to_owned()),
+            );
+            if page["next_cursor"].is_null() || seen.len() >= 72 {
+                break;
+            }
+            request["cursor"] = page["next_cursor"].clone();
+        }
+        let walk_us = t.elapsed().as_micros();
+        let expected: Vec<_> = (0..rows)
+            .rev()
+            .filter(|i| i % 8 < 4)
+            .take(72)
+            .map(|i| format!("row-{i:06}"))
+            .collect();
+        assert_eq!(seen, expected);
+        if rows == 2048 {
+            assert!(empty_pages > 0);
+        }
         let id = format!("row-{:06}", rows - 8);
         let copy =
             json!({"bank":"notes","bank_db_id":bank,"session_db_id":source.0,"message_ids":[id]});
@@ -1491,7 +1611,8 @@ async fn session_excerpt_growth() {
         let recall_us = t.elapsed().as_micros();
         assert!(result.contains(&id));
         eprintln!(
-            "rows={rows} page_us={pages:?} next_us={next_us} copy_retry_us={imports:?} recall_us={recall_us} page_bytes={page_len} sqlite_plus_sidecars_before={start_bytes} after={}",
+            "rows={rows} first_excerpts_us={pages:?} walk_us={walk_us} walk_excerpts={} empty_pages={empty_pages} copy_retry_us={imports:?} recall_us={recall_us} max_page_bytes={page_len} sqlite_plus_sidecars_before={start_bytes} after={}",
+            seen.len(),
             disk_bytes()
         );
     }
