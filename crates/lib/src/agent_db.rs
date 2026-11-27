@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use tracing::info;
 
 pub const CONFIG_STORE: &str = "config";
-pub const MEMORY_STORE: &str = "memory";
+pub use chaz_memory_store::{MEMORY_STORE, MemoryEntry};
 pub const META_STORE: &str = "meta";
 pub const HISTORY_STORE: &str = "history";
 pub const MEMORY_BANKS_STORE: &str = "memory_banks";
@@ -489,18 +489,6 @@ impl AgentDbConfig {
     }
 }
 
-/// A single memory fact stored in the agent's `memory` table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEntry {
-    pub key: String,
-    pub value: String,
-    pub timestamp: DateTime<Utc>,
-    /// Free-form labels for filtering recall. Default empty for back-compat
-    /// with entries written before tags existed.
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
 /// Record that this agent participated in a given session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHistoryEntry {
@@ -838,7 +826,7 @@ impl AgentDb {
     pub async fn ensure_stores(&self) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
         txn.get_store::<DocStore>(CONFIG_STORE).await?;
-        txn.get_store::<Table<MemoryEntry>>(MEMORY_STORE).await?;
+        chaz_memory_store::memory_table(&txn).await?;
         txn.get_store::<DocStore>(META_STORE).await?;
         txn.get_store::<Table<SessionHistoryEntry>>(HISTORY_STORE)
             .await?;

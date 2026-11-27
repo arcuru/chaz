@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::agent::AgentRegistry;
-use crate::agent_db::{AgentDbConfig, AgentMeta, MEMORY_STORE, create_agent_db};
+use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
 use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::session::{Session, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
@@ -1087,17 +1087,9 @@ async fn search_memory_honors_entry_char_cap() {
         .await
         .unwrap()
         .expect("agent db open");
-    let out = search_memory(
-        agent_db.database(),
-        MEMORY_STORE,
-        "cap",
-        &[],
-        5,
-        Some(20),
-        None,
-    )
-    .await
-    .unwrap();
+    let out = search_memory(agent_db.database(), "cap", &[], 5, Some(20), None)
+        .await
+        .unwrap();
     assert!(
         out.contains(&format!("{}…", "y".repeat(20))),
         "expected 20-char value with elision, got: {out}"

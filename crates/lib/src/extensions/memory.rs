@@ -18,7 +18,7 @@
 //! /memory config reset
 //! ```
 
-use crate::agent_db::{MEMORY_STORE, MemoryEntry};
+use crate::agent_db::MemoryEntry;
 use crate::embedding::Embedder;
 use crate::extension::caps::{
     CapFuture, CapabilityKind, CapabilityRequest, ContextTail, MemoryAccess, MemoryHit, MemoryScope,
@@ -369,7 +369,6 @@ impl ContextTail for MemoryContextTail {
             // Search own memory
             let own_results = search_memory(
                 db,
-                MEMORY_STORE,
                 &query,
                 &[],
                 max_entries,
@@ -425,7 +424,6 @@ impl ContextTail for MemoryContextTail {
                     };
                     let results = search_memory(
                         &bank,
-                        MEMORY_STORE,
                         &query,
                         &[],
                         max_entries,
@@ -531,16 +529,9 @@ impl MemoryAccess for MemoryAccessImpl {
         Box::pin(async move {
             let (caller, db, bank_label) =
                 self.open_scope(agent_name, scope, Permission::Read).await?;
-            let scored = search_memory_structured(
-                &db,
-                MEMORY_STORE,
-                query,
-                &[],
-                10,
-                self.embedder.as_deref(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let scored = search_memory_structured(&db, query, &[], 10, self.embedder.as_deref())
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             if let Some(name) = &bank_label {
                 SessionRegistry::check_index_grant(&db, &caller.pubkey, Permission::Read)
                     .await
@@ -577,7 +568,6 @@ impl MemoryAccess for MemoryAccessImpl {
             };
             write_memory_entry(
                 &db,
-                MEMORY_STORE,
                 entry,
                 self.embedder.as_deref(),
                 bank.as_ref().map(|_| &caller),
@@ -1823,7 +1813,6 @@ mod tests {
             .unwrap();
         write_memory_entry(
             owner.database(),
-            MEMORY_STORE,
             MemoryEntry {
                 key: key.into(),
                 value: value.into(),
@@ -1836,6 +1825,219 @@ mod tests {
         .await
         .unwrap();
         bank
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_bank_batch_is_visible_to_native_recall() {
+        use chaz_memory_store::{MemoryChanges, MemoryUpsert, apply_batch, memory_table};
+        use eidetica::{
+            account::AccountSigner, auth::crypto::generate_keypair, service::ServiceServer,
+            store::Table,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let (instance, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        assert_text(cmd.new_cmd("mirror").await, "mirror");
+        assert_text(cmd.grant_cmd("mirror alpha read").await, "mirror");
+        let bank = cmd.memory_bank_index.find_by_name("mirror").unwrap();
+        let owner = registry
+            .open_memory_bank(&bank.db_id, Some(&bank.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = owner.database();
+
+        // Write the old wire shape, without using the new Rust type to seed it.
+        let tx = owner.new_transaction().await.unwrap();
+        let old = tx
+            .get_store::<Table<serde_json::Value>>("memory")
+            .await
+            .unwrap();
+        let fixed = "2025-01-02T03:04:05Z";
+        for (id, key, value, tagged) in [
+            ("note:v1:0000", "lighthouse source", "amberbeacon", true),
+            ("note:v1:0001", "lighthouse obsolete", "fossilbeacon", true),
+            ("note:v1:0002", "lighthouse constant", "steadybeacon", true),
+            ("manual", "lighthouse manual", "independentbeacon", false),
+        ] {
+            let mut row = serde_json::json!({"key": key, "value": value, "timestamp": fixed});
+            if tagged {
+                row["tags"] = serde_json::json!(["note-import-v1", "sha256:old"]);
+            }
+            old.set(id, row).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let (key, pubkey) = generate_keypair();
+        registry
+            .grant_on_memory_bank(
+                &bank.db_id,
+                &pubkey,
+                "source writer",
+                crate::agent_db::BankPermission::Write,
+            )
+            .await
+            .unwrap();
+        let signer = AccountSigner::new(bank.db_id.clone(), key);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("service.sock");
+        let (shutdown, receiver) = tokio::sync::watch::channel(());
+        let service = ServiceServer::bind(instance, &socket).await.unwrap();
+        let service = tokio::spawn(service.run(receiver));
+        let connection = signer
+            .connect(format!("unix://{}", socket.display()))
+            .await
+            .unwrap();
+        let writer = signer
+            .open_database(&connection, &bank.db_id)
+            .await
+            .unwrap();
+
+        let caller = cmd.agent_index.find_by_name("alpha").unwrap();
+        let tail = MemoryContextTail {
+            registry: registry.clone(),
+            agent_index: cmd.agent_index.clone(),
+            memory_bank_index: cmd.memory_bank_index.clone(),
+            embedder: None,
+            session_attached_banks: vec!["mirror".into()],
+        };
+        let recent = vec!["lighthouse".into()];
+        let call = crate::extension::caps::ContextTailCall {
+            agent_name: "alpha",
+            agent_identity: Some(&caller),
+            recent_message_text: &recent,
+            session_db_id: None,
+            request_id: None,
+        };
+        // Raise only the fixture limit so every sentinel can be checked together.
+        let agent = registry
+            .open_agent_db(&caller.db_id, Some(&caller.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut config = load_auto_recall_config(agent.database()).await;
+        config.auto_recall_max_entries = 10;
+        save_auto_recall_config(agent.database(), &config)
+            .await
+            .unwrap();
+        let before = tail.context_tail(&call).await.unwrap().unwrap();
+        assert!(
+            before.contains("amberbeacon") && before.contains("fossilbeacon"),
+            "{before}"
+        );
+
+        let upserts = [
+            MemoryUpsert {
+                id: "note:v1:0000".into(),
+                key: "lighthouse source".into(),
+                value: "violetbeacon".into(),
+                tags: vec!["note-import-v1".into(), "sha256:new".into()],
+            },
+            MemoryUpsert {
+                id: "note:v1:0002".into(),
+                key: "lighthouse constant".into(),
+                value: "steadybeacon".into(),
+                tags: vec!["note-import-v1".into(), "sha256:old".into()],
+            },
+            MemoryUpsert {
+                id: "note:v1:0003".into(),
+                key: "lighthouse new".into(),
+                value: "verdantbeacon".into(),
+                tags: vec!["note-import-v1".into(), "sha256:new".into()],
+            },
+        ];
+        let deletes = vec!["note:v1:0001".into()];
+        assert_eq!(
+            apply_batch(&writer, &upserts, &deletes).await.unwrap(),
+            MemoryChanges {
+                inserted: 1,
+                updated: 1,
+                removed: 1
+            }
+        );
+        let tx = owner.new_transaction().await.unwrap();
+        let table = memory_table(&tx).await.unwrap();
+        let changed = table.get("note:v1:0000").await.unwrap();
+        assert_eq!(changed.tags, ["note-import-v1", "sha256:new"]);
+        assert_ne!(
+            changed.timestamp.to_rfc3339(),
+            table
+                .get("note:v1:0002")
+                .await
+                .unwrap()
+                .timestamp
+                .to_rfc3339()
+        );
+        assert_eq!(
+            table.get("note:v1:0002").await.unwrap().timestamp,
+            fixed.parse::<chrono::DateTime<chrono::Utc>>().unwrap()
+        );
+        let manual = table.get("manual").await.unwrap();
+        assert_eq!(manual.value, "independentbeacon");
+        assert!(manual.tags.is_empty());
+        let tips = owner.snapshot().await.unwrap();
+        assert_eq!(
+            apply_batch(&writer, &upserts, &deletes).await.unwrap(),
+            MemoryChanges::default()
+        );
+        assert_eq!(owner.snapshot().await.unwrap(), tips);
+
+        let after = tail.context_tail(&call).await.unwrap().unwrap();
+        for sentinel in [
+            "violetbeacon",
+            "verdantbeacon",
+            "steadybeacon",
+            "independentbeacon",
+            "(from bank: mirror)",
+        ] {
+            assert!(after.contains(sentinel), "{after}");
+        }
+        assert!(
+            !after.contains("amberbeacon") && !after.contains("fossilbeacon"),
+            "{after}"
+        );
+        let access = access_for(&cmd);
+        let scope = MemoryScope::Bank {
+            name: "mirror".into(),
+        };
+        assert!(
+            !access
+                .search("alpha", "lighthouse", scope.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            access
+                .remember("alpha", "denied", "must not write", scope.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.snapshot().await.unwrap(), tips);
+
+        // Agent access and importer access have separate revocation controls.
+        assert_text(cmd.revoke_cmd("mirror alpha").await, "mirror");
+        let without_reader = tail.context_tail(&call).await.unwrap().unwrap_or_default();
+        assert!(!without_reader.contains("violetbeacon"));
+        assert_eq!(
+            apply_batch(&writer, &[], &["note:v1:0003".into()])
+                .await
+                .unwrap()
+                .removed,
+            1
+        );
+        registry
+            .revoke_on_memory_bank(&bank.db_id, &pubkey)
+            .await
+            .unwrap();
+        let revoked_tips = owner.snapshot().await.unwrap();
+        assert!(apply_batch(&writer, &upserts, &deletes).await.is_err());
+        assert_eq!(owner.snapshot().await.unwrap(), revoked_tips);
+        drop(shutdown);
+        service.await.unwrap().unwrap();
     }
 
     #[tokio::test]

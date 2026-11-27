@@ -902,6 +902,7 @@ dependencies = [
  "backoff",
  "base64 0.22.1",
  "blake3",
+ "chaz-memory-store",
  "chrono",
  "clap",
  "cron",
@@ -982,6 +983,18 @@ dependencies = [
  "tracing-subscriber",
  "wiremock",
  "yaml_serde",
+]
+
+[[package]]
+name = "chaz-memory-store"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "eidetica",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -18,18 +18,17 @@
 
 #![allow(dead_code)]
 
-use crate::agent_db::MemoryEntry;
 use crate::agent_record;
 use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
-use eidetica::store::{DocStore, Table};
+use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-pub const MEMORY_STORE: &str = "memory";
+pub use chaz_memory_store::MEMORY_STORE;
 pub const META_STORE: &str = "meta";
 
 /// Display metadata for a memory bank. Read by `/memory list` and by the
@@ -71,7 +70,7 @@ impl MemoryBankDb {
     /// repeatedly; commits in one transaction.
     pub async fn ensure_stores(&self) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
-        txn.get_store::<Table<MemoryEntry>>(MEMORY_STORE).await?;
+        chaz_memory_store::memory_table(&txn).await?;
         txn.get_store::<DocStore>(META_STORE).await?;
         txn.commit().await?;
         Ok(())
@@ -128,8 +127,10 @@ pub async fn find_memory_bank(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chaz_memory_store::MemoryEntry;
     use chrono::Utc;
     use eidetica::backend::database::InMemory;
+    use eidetica::store::Table;
     use eidetica::{Instance, NewAccount};
 
     async fn test_user() -> AccountSession {
